@@ -19,7 +19,7 @@ My [pi coding agent](https://github.com/badlogic/pi-mono) configuration — cust
 └── skills/
     └── skill-creator/     # Skill 创建、评估、迭代优化工具链
 
-weixin-bridge.ts           # 微信机器人扩展（需放到助手 workspace 下加载）
+weixin-bridge-rpc.mjs      # 微信桥接独立进程（RPC 模式，spawn pi --mode rpc）
 ```
 
 ## Setup
@@ -36,20 +36,32 @@ pi install npm:@koltmcbride/pi-loop
 
 ### 2. WeChat bridge
 
-`weixin-bridge.ts` 是一个独立的 pi 扩展，通过微信 ilink API 实现：
+`weixin-bridge-rpc.mjs` 是一个独立进程，作为微信与 pi agent 之间的桥接层：
 
-- 扫码登录（`/weixin-login`）
-- 消息轮询 & 自动回复
-- 主动发送消息
-- 联系人和 context-token 持久化
-
-将文件放到助手 workspace 的扩展目录下，或使用 `-e` 参数加载：
-
-```bash
-pi -e weixin-bridge.ts
+```
+┌──────────────────────┐   stdin (JSONL)   ┌─────────────────┐
+│  weixin-bridge-rpc   │ ────────────────► │  pi --mode rpc  │
+│  • 微信扫码登录       │                   │  无头 agent      │
+│  • 消息 polling       │ ◄──────────────── │  session 持久化  │
+│  • /new → new_session │   stdout (JSONL)  │                 │
+│  • agent_end → 回复   │                   │                 │
+└──────────────────────┘                   └─────────────────┘
 ```
 
-> **Note:** 该扩展调用 `https://ilinkai.weixin.qq.com` API，需要在可访问该服务的网络环境中运行。
+微信消息通过 RPC JSONL 协议转发给 pi，agent 回复后自动发回微信。支持：
+
+- 扫码登录（缓存 token，自动恢复）
+- `/new` 命令新建会话（走 RPC `new_session`，绕开进程内扩展限制）
+- agent 忙时消息自动排队（`follow_up`）
+- 联系人和 context-token 持久化
+
+```bash
+node weixin-bridge-rpc.mjs
+```
+
+可通过 `PI_BIN` 环境变量指定 pi 可执行文件路径。
+
+> **Note:** 该脚本调用 `https://ilinkai.weixin.qq.com` API，需要在可访问该服务的网络环境中运行。
 
 ### 3. web-search tool
 
