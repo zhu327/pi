@@ -8,7 +8,6 @@ My [pi coding agent](https://github.com/badlogic/pi-mono) configuration — cust
 .pi/agent/
 ├── AGENTS.md              # Karpathy 风格的 agent 行为准则
 ├── extensions/            # 自定义扩展
-│   ├── goal.ts            # 长时间目标跟踪与自动续跑（/goal 命令）
 │   ├── grep-find.ts       # 确保 grep、find 工具始终激活
 │   ├── model-patches.ts   # 模型级 patch（qwen3.7-max xhigh reasoning）
 │   ├── question.ts        # 结构化多问题 UI（chips、多选、预览）
@@ -28,10 +27,12 @@ weixin-bridge-rpc.mjs      # 微信桥接独立进程（RPC 模式，spawn pi --
 
 ```bash
 pi install npm:@gotgenes/pi-subagents
+pi install npm:pi-codex-goal
 pi install npm:@koltmcbride/pi-loop
 ```
 
 - **@gotgenes/pi-subagents** — Claude Code 风格的子代理：在隔离 session 中并行执行任务，支持前台/后台运行、中途 steer、自定义 agent 类型。
+- **pi-codex-goal** - Codex 风格的 Goal 目标跟踪，设定一个完成条件后 agent 自动循环推进，直到目标达成或手动停止。
 - **@koltmcbride/pi-loop** — 定时/循环 prompt 调度，可按 interval 或 cron 反复执行任务。
 
 ### 2. WeChat bridge
@@ -77,7 +78,6 @@ node weixin-bridge-rpc.mjs
 
 | Extension | Description |
 |-----------|-------------|
-| `goal.ts` | `/goal` 命令，设定一个完成条件后 agent 自动循环推进，直到目标达成或手动停止 |
 | `todo.ts` | `/todos` 命令，pending → in_progress → completed 的任务管理，带 TUI overlay |
 | `question.ts` | 结构化提问工具，支持单选/多选/自由输入，带预览面板 |
 | `web-fetch.ts` | 抓取 URL 内容并转为 markdown/text/html，内置大小限制和安全防护 |
