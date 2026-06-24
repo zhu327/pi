@@ -264,12 +264,142 @@ function stopPolling() {
 }
 
 // ============================================================================
+// 日志与可观测性（打印 pi 返回的事件：prompt 响应 / 工具调用 / AI 回复 / 压缩重试等）
+// ============================================================================
+
+const LOG_TRUNC = 300;
+
+function ts() {
+  return new Date().toISOString().slice(11, 19); // HH:MM:SS
+}
+
+function trunc(value, n = LOG_TRUNC) {
+  if (value == null) return "";
+  const s = typeof value === "string" ? value : JSON.stringify(value);
+  return s.length > n ? `${s.slice(0, n)}…(+${s.length - n})` : s;
+}
+
+function logPi(icon, label, detail = "") {
+  console.log(detail ? `[${ts()}] ${icon} ${label} ${detail}` : `[${ts()}] ${icon} ${label}`);
+}
+
+function summarizeArgs(args) {
+  if (!args || typeof args !== "object") return "";
+  return Object.entries(args)
+    .map(([k, v]) => `${k}=${trunc(v, 120)}`)
+    .join(" ");
+}
+
+function assistantText(message) {
+  let t = "";
+  for (const c of message?.content ?? []) if (c.type === "text") t += c.text;
+  return t.trim();
+}
+
+// 取最后一条 assistant 文本回复（用于回发微信与日志）
+function lastAssistantText(messages) {
+  let text = "";
+  for (const m of messages) {
+    if (m.role !== "assistant") continue;
+    const t = assistantText(m);
+    if (t) text = t;
+  }
+  return text;
+}
+
+function toolResultPreview(result) {
+  if (!result?.content) return "";
+  const texts = [];
+  for (const c of result.content) if (c.type === "text") texts.push(c.text);
+  const full = texts.join("\n").trim();
+  if (!full) return "";
+  const lines = full.split("\n");
+  const first = lines[0].replace(/\s+/g, " ").trim();
+  const head = first.length > 80 ? `${first.slice(0, 80)}…` : first;
+  return lines.length > 1 ? `${head} · +${lines.length - 1}行` : head;
+}
+
+// 汇总本次 agent_end 的助手回复数 / 工具调用数 / token 与费用
+function summarizeRun(messages) {
+  let assistantCount = 0, toolCallCount = 0;
+  let inputTok = 0, outputTok = 0, cacheRead = 0, cost = 0;
+  for (const m of messages) {
+    if (m.role !== "assistant") continue;
+    assistantCount++;
+    for (const c of m.content ?? []) if (c.type === "toolCall") toolCallCount++;
+    const u = m.usage ?? {};
+    inputTok += u.input ?? 0;
+    outputTok += u.output ?? 0;
+    cacheRead += u.cacheRead ?? 0;
+    cost += u.cost?.total ?? 0;
+  }
+  return {
+    finalText: lastAssistantText(messages),
+    summary: `助手 ${assistantCount} 条 · 工具 ${toolCallCount} 次 · tokens 入${inputTok} 出${outputTok} 缓存${cacheRead} · $${cost.toFixed(4)}`,
+  };
+}
+
+// 打印 pi 返回的事件摘要（跳过高频的 message_update，避免噪声）
+function logPiEvent(ev) {
+  switch (ev.type) {
+    case "response":
+      logPi("📨", `${ev.command} 响应 ${ev.success ? "✅" : "❌"}`, ev.success ? "" : trunc(ev.error, 200));
+      break;
+    case "agent_start":
+      logPi("🤖", "pi 开始处理");
+      break;
+    case "tool_execution_start":
+      logPi("🔧", `工具调用 ${ev.toolName}`, summarizeArgs(ev.args));
+      break;
+    case "tool_execution_end":
+      logPi("🔧", `工具完成 ${ev.toolName} ${ev.isError ? "❌失败" : "✅成功"}`, toolResultPreview(ev.result));
+      break;
+    case "message_end":
+      if (ev.message?.role === "assistant") logPi("💬", "AI 回复", trunc(assistantText(ev.message), 200));
+      break;
+    case "agent_end": {
+      const stats = summarizeRun(ev.messages ?? []);
+      logPi("✅", "pi 处理完成", stats.summary);
+      if (stats.finalText) logPi("💬", "最终回复", trunc(stats.finalText, 500));
+      break;
+    }
+    case "compaction_end":
+      if (ev.result) {
+        logPi("📦", `上下文压缩 ${ev.reason}`, `${ev.result.tokensBefore}→${ev.result.estimatedTokensAfter} tokens${ev.willRetry ? "（将重试）" : ""}`);
+      } else {
+        logPi("📦", `上下文压缩 ${ev.reason} ${ev.aborted ? "已中止" : "失败"}`, ev.errorMessage ?? "");
+      }
+      break;
+    case "auto_retry_start":
+      logPi("🔁", `自动重试 ${ev.attempt}/${ev.maxAttempts}`, trunc(ev.errorMessage, 200));
+      break;
+    case "auto_retry_end":
+      logPi("🔁", `重试 ${ev.success ? "✅成功" : "❌失败"}（第 ${ev.attempt} 次）`, ev.success ? "" : trunc(ev.finalError, 200));
+      break;
+    case "extension_error":
+      logPi("⚠️", `扩展错误 [${ev.event}]`, trunc(ev.error, 300));
+      break;
+    default:
+      break;
+  }
+}
+
+// ============================================================================
 // pi RPC 客户端
 // ============================================================================
 
 function sendRpc(obj) {
   if (!piProc) return;
   piProc.stdin.write(JSON.stringify(obj) + "\n");
+}
+
+function sendPromptRpc(message) {
+  logPi("📨", "发送 prompt", trunc(message, 200));
+  sendRpc({
+    type: "prompt",
+    message,
+    ...(isStreaming ? { streamingBehavior: "follow_up" } : {}),
+  });
 }
 
 function startPi() {
@@ -307,6 +437,8 @@ function onPiEvent(line) {
   let ev;
   try { ev = JSON.parse(line); } catch { return; }
 
+  logPiEvent(ev);
+
   switch (ev.type) {
     case "agent_start":
       isStreaming = true;
@@ -336,15 +468,8 @@ function onPiEvent(line) {
 function handleAgentEnd(ev) {
   const target = replyQueue.shift();
   if (!target || !isConnected) return;
-  const messages = ev.messages ?? [];
-  let text = "";
-  for (const m of messages) {
-    if (m.role !== "assistant") continue;
-    let t = "";
-    for (const c of m.content ?? []) if (c.type === "text") t += c.text;
-    if (t.trim()) text = t.trim();
-  }
-  if (!text || text.startsWith("[微信消息]")) return;
+  const text = lastAssistantText(ev.messages ?? []);
+  if (!text) return;
   sendWeixinMsg(target.userId, text, target.contextToken).catch(() => {});
 }
 
@@ -367,17 +492,13 @@ async function onWeixinMessage(msg, savedCtx) {
   // 其他斜杠命令：作为 prompt 发送（扩展命令会被 pi 执行；内置命令无效但不报错）
   if (msg.text.startsWith("/")) {
     replyQueue.push({ userId: msg.userId, contextToken });
-    sendRpc({ type: "prompt", message: msg.text, ...(isStreaming ? { streamingBehavior: "follow_up" } : {}) });
+    sendPromptRpc(msg.text);
     return;
   }
 
   // 普通消息
   replyQueue.push({ userId: msg.userId, contextToken });
-  sendRpc({
-    type: "prompt",
-    message: `[微信消息] ${msg.text}`,
-    ...(isStreaming ? { streamingBehavior: "follow_up" } : {}),
-  });
+  sendPromptRpc(msg.text);
 }
 
 // ============================================================================
