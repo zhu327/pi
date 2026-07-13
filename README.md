@@ -12,7 +12,8 @@ My [pi coding agent](https://github.com/badlogic/pi-mono) configuration — cust
 │   ├── model-patches.ts   # 模型级 patch（qwen3.7-max xhigh reasoning）
 │   ├── question.ts        # 结构化多问题 UI（chips、多选、预览）
 │   ├── todo.ts            # 4 状态任务管理 + overlay widget（/todos 命令）
-│   └── web-fetch.ts       # URL 抓取转 markdown，含 SSRF 防护
+│   ├── web-fetch.ts       # URL 抓取转 markdown，含 SSRF 防护
+│   └── wsl-notify.ts      # WSL 下 Windows 气泡通知（切出终端时提醒）
 ├── prompts/
 │   └── handoff.md         # 会话交接 prompt（替代上下文压缩）
 └── skills/
@@ -83,6 +84,23 @@ node weixin-bridge-rpc.mjs
 | `web-fetch.ts` | 抓取 URL 内容并转为 markdown/text/html，内置大小限制和安全防护 |
 | `grep-find.ts` | session 启动时自动激活 grep、find 工具 |
 | `model-patches.ts` | 为 `ali/qwen3.7-max` 注入 xhigh reasoning prompt |
+| `wsl-notify.ts` | WSL 下检测前台窗口，切出 Windows Terminal 时弹气泡通知 |
+
+## WSL Notify
+
+`wsl-notify.ts` 在 WSL 环境下通过 PowerShell 发送 Windows 气泡通知。当 pi 完成任务（`agent_settled`）或向你提问（`question` 工具调用）时，如果你已切出 Windows Terminal，就会弹出通知提醒你。
+
+整个检测 + 通知合并为一次 PowerShell 调用，前台是终端时静默跳过，不影响 pi 正常工作。
+
+**环境变量（均可选）：**
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `PI_NOTIFY_DISABLED` | — | 设为 `1` 关闭整个扩展 |
+| `PI_NOTIFY_FOCUS_APPS` | `WindowsTerminal` | 前台终端进程名列表（逗号分隔） |
+| `PI_NOTIFY_SKIP_FOCUS` | — | 设为 `1` 跳过前台检测，总是通知 |
+| `PI_NOTIFY_POWERSHELL` | `powershell.exe` | PowerShell 可执行文件路径 |
+| `PI_NOTIFY_TITLE` | `Pi` | 通知标题 |
 
 ## License
 
