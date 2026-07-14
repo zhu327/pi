@@ -13,6 +13,9 @@
  *   - agent_settled      pi 完成任务、空闲等待你的下一步输入
  *   - tool_call(question) pi 正在向你提问，需要你操作
  *
+ * 点击通知会把已打开的 Windows Terminal 窗口提到前台：脚本存活约 8 秒
+ * 等待点击，点击时用 AppActivate 激活前台终端进程。
+ *
  * 环境变量配置（均可选）：
  *   PI_NOTIFY_DISABLED=1     关闭整个扩展
  *   PI_NOTIFY_FOCUS_APPS     前台终端进程名列表（逗号分隔），默认 WindowsTerminal
@@ -68,12 +71,17 @@ function buildNotifyScript(body: string): string {
 	const text = psSingle(snippet(body, 200));
 	const apps = FOCUS_APPS.map((a) => `'${psSingle(a)}'`).join(",");
 
+	const activateApp = psSingle(FOCUS_APPS[0] ?? "WindowsTerminal");
 	const balloon = [
 		"Add-Type -AssemblyName System.Windows.Forms",
+		"Add-Type -AssemblyName Microsoft.VisualBasic",
 		"$n = New-Object System.Windows.Forms.NotifyIcon",
 		"$n.Icon = [System.Drawing.SystemIcons]::Information",
 		"$n.Visible = $true",
+		`$n.Add_BalloonTipClicked({ try { $wt = Get-Process -Name '${activateApp}' -ErrorAction SilentlyContinue | Select-Object -First 1; if ($wt) { [Microsoft.VisualBasic.Interaction]::AppActivate($wt.Id) } } catch {} })`,
 		`$n.ShowBalloonTip(5000, '${title}', '${text}', [System.Windows.Forms.ToolTipIcon]::Info)`,
+		"Start-Sleep -Seconds 8",
+		"$n.Dispose()",
 	].join("; ");
 
 	if (SKIP_FOCUS) return balloon;
@@ -108,7 +116,7 @@ async function notify(body: string): Promise<void> {
 	lastKey = body;
 	lastTime = now;
 	try {
-		await runPowerShell(buildNotifyScript(body));
+		await runPowerShell(buildNotifyScript(body), 12000);
 	} catch {
 		// 通知是 best-effort，失败绝不影响 pi
 	}
