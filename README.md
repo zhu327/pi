@@ -28,46 +28,15 @@ weixin-bridge-rpc.mjs      # 微信桥接独立进程（RPC 模式，spawn pi --
 
 ```bash
 pi install npm:@gotgenes/pi-subagents
-pi install npm:pi-codex-goal
-pi install npm:@koltmcbride/pi-loop
 ```
 
 - **@gotgenes/pi-subagents** — Claude Code 风格的子代理：在隔离 session 中并行执行任务，支持前台/后台运行、中途 steer、自定义 agent 类型。
-- **pi-codex-goal** - Codex 风格的 Goal 目标跟踪，设定一个完成条件后 agent 自动循环推进，直到目标达成或手动停止。
-- **@koltmcbride/pi-loop** — 定时/循环 prompt 调度，可按 interval 或 cron 反复执行任务。
 
-### 2. WeChat bridge
-
-`weixin-bridge-rpc.mjs` 是一个独立进程，作为微信与 pi agent 之间的桥接层：
-
-```
-┌──────────────────────┐   stdin (JSONL)   ┌─────────────────┐
-│  weixin-bridge-rpc   │ ────────────────► │  pi --mode rpc  │
-│  • 微信扫码登录       │                   │  无头 agent      │
-│  • 消息 polling       │ ◄──────────────── │  session 持久化  │
-│  • /new → new_session │   stdout (JSONL)  │                 │
-│  • agent_end → 回复   │                   │                 │
-└──────────────────────┘                   └─────────────────┘
-```
-
-微信消息通过 RPC JSONL 协议转发给 pi，agent 回复后自动发回微信。支持：
-
-- 扫码登录（缓存 token，自动恢复）
-- `/new` 命令新建会话（走 RPC `new_session`，绕开进程内扩展限制）
-- agent 忙时消息自动排队（`follow_up`）
-- 联系人和 context-token 持久化
-
-```bash
-node weixin-bridge-rpc.mjs
-```
-
-可通过 `PI_BIN` 环境变量指定 pi 可执行文件路径。
-
-> **Note:** 该脚本调用 `https://ilinkai.weixin.qq.com` API，需要在可访问该服务的网络环境中运行。
-
-### 3. web-search tool
+### 2. web-search tool
 
 项目中还有一个 `web-search.ts` 工具，因使用了公司内部 API，不包含在本仓库中。
+
+可以基于 Tavily 或者 Brave 实现一个自己的 `web-search` Tool。
 
 ## Design choices
 
@@ -101,6 +70,35 @@ node weixin-bridge-rpc.mjs
 | `PI_NOTIFY_SKIP_FOCUS` | — | 设为 `1` 跳过前台检测，总是通知 |
 | `PI_NOTIFY_POWERSHELL` | `powershell.exe` | PowerShell 可执行文件路径 |
 | `PI_NOTIFY_TITLE` | `Pi` | 通知标题 |
+
+## WeChat bridge
+
+`weixin-bridge-rpc.mjs` 是一个独立进程，作为微信与 pi agent 之间的桥接层：
+
+```
+┌──────────────────────┐   stdin (JSONL)   ┌─────────────────┐
+│  weixin-bridge-rpc   │ ────────────────► │  pi --mode rpc  │
+│  • 微信扫码登录       │                   │  无头 agent      │
+│  • 消息 polling       │ ◄──────────────── │  session 持久化  │
+│  • /new → new_session │   stdout (JSONL)  │                 │
+│  • agent_end → 回复   │                   │                 │
+└──────────────────────┘                   └─────────────────┘
+```
+
+微信消息通过 RPC JSONL 协议转发给 pi，agent 回复后自动发回微信。支持：
+
+- 扫码登录（缓存 token，自动恢复）
+- `/new` 命令新建会话（走 RPC `new_session`，绕开进程内扩展限制）
+- agent 忙时消息自动排队（`follow_up`）
+- 联系人和 context-token 持久化
+
+```bash
+node weixin-bridge-rpc.mjs
+```
+
+可通过 `PI_BIN` 环境变量指定 pi 可执行文件路径。
+
+> **Note:** 该脚本调用 `https://ilinkai.weixin.qq.com` API，需要在可访问该服务的网络环境中运行。
 
 ## License
 
