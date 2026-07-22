@@ -54,7 +54,7 @@ type DisplayOption = QuestionOption & { isOther?: boolean };
 // ---------------------------------------------------------------------------
 
 const QuestionOptionSchema = Type.Object({
-	value: Type.String({ description: "The value returned when selected" }),
+	value: Type.Optional(Type.String({ description: "The value returned when selected. Optional: if omitted, defaults to the option's label, so you usually only need to provide `label`." })),
 	label: Type.String({ description: "Display label for the option (1-5 words, max 60 chars)" }),
 	description: Type.Optional(Type.String({ description: "Explanation of what this option means or what will happen if chosen" })),
 	preview: Type.Optional(Type.String({ description: "Optional preview content (markdown/code) shown next to options when focused" })),
@@ -109,7 +109,8 @@ function formatQuestionsAsText(questions: Question[]): string {
 			if (q.multiSelect) lines.push("  (multi-select: choose one or more)");
 			for (let i = 0; i < q.options.length; i++) {
 				const opt = q.options[i];
-				let line = `  ${i + 1}. ${opt.label} (value: ${opt.value})`;
+				const valuePart = opt.value !== opt.label ? ` (value: ${opt.value})` : "";
+				let line = `  ${i + 1}. ${opt.label}${valuePart}`;
 				if (opt.description) line += ` — ${opt.description}`;
 				if (opt.preview) line += ` [has preview]`;
 				lines.push(line);
@@ -250,7 +251,7 @@ export default function question(pi: ExtensionAPI) {
 			}
 
 			const questions: Question[] = params.questions.map((q, i) => {
-				const options = q.options ?? [];
+				const options = (q.options ?? []).map((opt) => ({ ...opt, value: opt.value ?? opt.label }));
 				const multiSelect = q.multiSelect ?? false;
 				const hasPreview = options.some((opt) => !!opt.preview);
 				return {

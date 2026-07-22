@@ -40,6 +40,7 @@ const WEIXIN_DIR = join(PROJECT_DIR, ".pi", "weixin");
 const API_BASE = "https://ilinkai.weixin.qq.com";
 const POLL_TIMEOUT = 35000;
 const PI_BIN = process.env.PI_BIN || "pi";
+const WEIXIN_MSG_LIMIT = 4000; // 微信单条消息字符上限
 
 // ============================================================================
 // 微信状态
@@ -167,6 +168,194 @@ async function sendWeixinMsg(to, text, contextToken) {
   });
 }
 
+/**
+ * 把 Markdown 文本拆成 "block" 序列。
+ * block 类型：code（围栏代码块）、heading、li（列表项）、hr（分隔线）、text（普通段落）
+ */
+function parseMdBlocks(text) {
+  const lines = text.split(/\r?\n/);
+  const blocks = [];
+  let i = 0;
+
+  while (i < lines.length) {
+    const line = lines[i];
+
+    // 围栏代码块：原样保留，绝不拆分
+    if (/^`{3,}/.test(line.trimStart())) {
+      const fenceMatch = line.trimStart().match(/^(`{3,})/);
+      const fence = fenceMatch[1];
+      const codeLines = [line];
+      i++;
+      while (i < lines.length) {
+        codeLines.push(lines[i]);
+        if (lines[i].trimStart().startsWith(fence) && lines[i].trim() === fence) { i++; break; }
+        i++;
+      }
+      blocks.push({ type: "code", text: codeLines.join("\n") });
+      continue;
+    }
+
+    // 标题
+    if (/^#{1,6}\s/.test(line)) {
+      blocks.push({ type: "heading", text: line });
+      i++;
+      continue;
+    }
+
+    // 分隔线
+    if (/^(\*{3,}|-{3,}|_{3,})\s*$/.test(line.trim())) {
+      blocks.push({ type: "hr", text: line });
+      i++;
+      continue;
+    }
+
+    // 列表项（无序 / 有序 / 任务列表）
+    if (/^\s*(?:[-*+]|\d+[.)])\s/.test(line)) {
+      const itemLines = [line];
+      i++;
+      // 延续行（缩进 ≥2 空格或制表符）
+      while (i < lines.length && /^\s{2,}/.test(lines[i]) && lines[i].trim() !== "") {
+        itemLines.push(lines[i]);
+        i++;
+      }
+      blocks.push({ type: "li", text: itemLines.join("\n") });
+      continue;
+    }
+
+    // 空行 → 跳过
+    if (line.trim() === "") { i++; continue; }
+
+    // 普通段落（连续非空行合并）
+    const paraLines = [line];
+    i++;
+    while (
+      i < lines.length
+      && lines[i].trim() !== ""
+      && !/^`{3,}/.test(lines[i].trimStart())
+      && !/^#{1,6}\s/.test(lines[i])
+      && !/^\s*(?:[-*+]|\d+[.)])\s/.test(lines[i])
+      && !/^(\*{3,}|-{3,}|_{3,})\s*$/.test(lines[i].trim())
+    ) {
+      paraLines.push(lines[i]);
+      i++;
+    }
+    blocks.push({ type: "text", text: paraLines.join("\n") });
+  }
+
+  return blocks;
+}
+
+/** 在行内代码范围之外的句子边界处拆分段落 */
+function splitParagraphAtSentence(text, limit) {
+  const chars = Array.from(text);
+  const len = chars.length;
+  if (len <= limit) return [text];
+
+  // 标记每个字符是否在行内代码（`...`）范围内
+  const inCode = new Uint8Array(len);
+  let code = false;
+  for (let i = 0; i < len; i++) {
+    if (chars[i] === "`") code = !code;
+    inCode[i] = code ? 1 : 0;
+  }
+
+  const chunks = [];
+  let start = 0;
+
+  while (len - start > limit) {
+    let bestBreak = -1;
+    // 从 limit 位置向前找最近的句子边界
+    for (let j = Math.min(start + limit - 1, len - 1); j >= start + Math.floor(limit * 0.3); j--) {
+      if (inCode[j]) continue;
+      const ch = chars[j];
+      if ("。！？.!?\"".includes(ch)) { bestBreak = j + 1; break; }
+    }
+    // 找不到句子边界 → 找空格
+    if (bestBreak === -1) {
+      for (let j = Math.min(start + limit - 1, len - 1); j >= start + Math.floor(limit * 0.3); j--) {
+        if (inCode[j]) continue;
+        if (chars[j] === " ") { bestBreak = j + 1; break; }
+      }
+    }
+    // 兜底硬切
+    if (bestBreak === -1) bestBreak = start + limit;
+    chunks.push(chars.slice(start, bestBreak).join(""));
+    start = bestBreak;
+  }
+  if (start < len) chunks.push(chars.slice(start).join(""));
+  return chunks;
+}
+
+/**
+ * Markdown 感知的分片：
+ *   1. 拆成 block 序列（代码块 / 标题 / 列表项 / 段落）
+ *   2. 贪心装箱：尽量把多个 block 塞进同一片
+ *   3. 代码块即使超限也整体保留（不拆围栏）
+ *   4. 段落超限则在句子边界处拆分（跳出行内代码范围）
+ */
+function chunkText(text, limit = WEIXIN_MSG_LIMIT) {
+  const cLen = Array.from(text).length;
+  if (cLen <= limit) return [text];
+
+  const blocks = parseMdBlocks(text);
+  const chunks = [];
+  let buf = "";
+  let bufLen = 0;
+
+  function charLen(s) { return Array.from(s).length; }
+
+  function flush() {
+    if (buf) { chunks.push(buf.trimEnd()); buf = ""; bufLen = 0; }
+  }
+
+  function append(s) {
+    if (buf) { buf += "\n\n"; bufLen += 2; }
+    buf += s;
+    bufLen += charLen(s);
+  }
+
+  for (const block of blocks) {
+    const bLen = charLen(block.text);
+    const fitsInBuf = bufLen === 0 || bufLen + 2 + bLen <= limit;
+
+    // 代码块：永远不拆围栏
+    if (block.type === "code") {
+      if (fitsInBuf) { append(block.text); } else { flush(); append(block.text); flush(); }
+      continue;
+    }
+
+    // 标题：和下一个 block 一起放，避免孤立
+    if (block.type === "heading") {
+      if (bufLen > 0 && bufLen + 2 + bLen > limit) flush();
+      append(block.text);
+      continue;
+    }
+
+    // 能塞进当前片且自身不超限 → 直接加（text / li / hr）
+    if (fitsInBuf && bLen <= limit) {
+      append(block.text);
+      continue;
+    }
+
+    // 超限的段落 / 列表项：按句子拆分
+    flush();
+    const subChunks = splitParagraphAtSentence(block.text, limit);
+    for (const sc of subChunks) append(sc), flush();
+  }
+
+  flush();
+  return chunks;
+}
+
+/** 分片发送微信消息，片间加短延时避免频率限制 */
+async function sendWeixinMsgChunked(to, text, contextToken) {
+  const chunks = chunkText(text);
+  for (let i = 0; i < chunks.length; i++) {
+    if (i > 0) await new Promise((r) => setTimeout(r, 500));
+    await sendWeixinMsg(to, chunks[i], contextToken);
+  }
+}
+
 function extractText(msgs) {
   const results = [];
   for (const msg of msgs ?? []) {
@@ -264,12 +453,142 @@ function stopPolling() {
 }
 
 // ============================================================================
+// 日志与可观测性（打印 pi 返回的事件：prompt 响应 / 工具调用 / AI 回复 / 压缩重试等）
+// ============================================================================
+
+const LOG_TRUNC = 300;
+
+function ts() {
+  return new Date().toISOString().slice(11, 19); // HH:MM:SS
+}
+
+function trunc(value, n = LOG_TRUNC) {
+  if (value == null) return "";
+  const s = typeof value === "string" ? value : JSON.stringify(value);
+  return s.length > n ? `${s.slice(0, n)}…(+${s.length - n})` : s;
+}
+
+function logPi(icon, label, detail = "") {
+  console.log(detail ? `[${ts()}] ${icon} ${label} ${detail}` : `[${ts()}] ${icon} ${label}`);
+}
+
+function summarizeArgs(args) {
+  if (!args || typeof args !== "object") return "";
+  return Object.entries(args)
+    .map(([k, v]) => `${k}=${trunc(v, 120)}`)
+    .join(" ");
+}
+
+function assistantText(message) {
+  let t = "";
+  for (const c of message?.content ?? []) if (c.type === "text") t += c.text;
+  return t.trim();
+}
+
+// 取最后一条 assistant 文本回复（用于回发微信与日志）
+function lastAssistantText(messages) {
+  let text = "";
+  for (const m of messages) {
+    if (m.role !== "assistant") continue;
+    const t = assistantText(m);
+    if (t) text = t;
+  }
+  return text;
+}
+
+function toolResultPreview(result) {
+  if (!result?.content) return "";
+  const texts = [];
+  for (const c of result.content) if (c.type === "text") texts.push(c.text);
+  const full = texts.join("\n").trim();
+  if (!full) return "";
+  const lines = full.split("\n");
+  const first = lines[0].replace(/\s+/g, " ").trim();
+  const head = first.length > 80 ? `${first.slice(0, 80)}…` : first;
+  return lines.length > 1 ? `${head} · +${lines.length - 1}行` : head;
+}
+
+// 汇总本次 agent_end 的助手回复数 / 工具调用数 / token 与费用
+function summarizeRun(messages) {
+  let assistantCount = 0, toolCallCount = 0;
+  let inputTok = 0, outputTok = 0, cacheRead = 0, cost = 0;
+  for (const m of messages) {
+    if (m.role !== "assistant") continue;
+    assistantCount++;
+    for (const c of m.content ?? []) if (c.type === "toolCall") toolCallCount++;
+    const u = m.usage ?? {};
+    inputTok += u.input ?? 0;
+    outputTok += u.output ?? 0;
+    cacheRead += u.cacheRead ?? 0;
+    cost += u.cost?.total ?? 0;
+  }
+  return {
+    finalText: lastAssistantText(messages),
+    summary: `助手 ${assistantCount} 条 · 工具 ${toolCallCount} 次 · tokens 入${inputTok} 出${outputTok} 缓存${cacheRead} · $${cost.toFixed(4)}`,
+  };
+}
+
+// 打印 pi 返回的事件摘要（跳过高频的 message_update，避免噪声）
+function logPiEvent(ev) {
+  switch (ev.type) {
+    case "response":
+      logPi("📨", `${ev.command} 响应 ${ev.success ? "✅" : "❌"}`, ev.success ? "" : trunc(ev.error, 200));
+      break;
+    case "agent_start":
+      logPi("🤖", "pi 开始处理");
+      break;
+    case "tool_execution_start":
+      logPi("🔧", `工具调用 ${ev.toolName}`, summarizeArgs(ev.args));
+      break;
+    case "tool_execution_end":
+      logPi("🔧", `工具完成 ${ev.toolName} ${ev.isError ? "❌失败" : "✅成功"}`, toolResultPreview(ev.result));
+      break;
+    case "message_end":
+      if (ev.message?.role === "assistant") logPi("💬", "AI 回复", trunc(assistantText(ev.message), 200));
+      break;
+    case "agent_end": {
+      const stats = summarizeRun(ev.messages ?? []);
+      logPi("✅", "pi 处理完成", stats.summary);
+      if (stats.finalText) logPi("💬", "最终回复", trunc(stats.finalText, 500));
+      break;
+    }
+    case "compaction_end":
+      if (ev.result) {
+        logPi("📦", `上下文压缩 ${ev.reason}`, `${ev.result.tokensBefore}→${ev.result.estimatedTokensAfter} tokens${ev.willRetry ? "（将重试）" : ""}`);
+      } else {
+        logPi("📦", `上下文压缩 ${ev.reason} ${ev.aborted ? "已中止" : "失败"}`, ev.errorMessage ?? "");
+      }
+      break;
+    case "auto_retry_start":
+      logPi("🔁", `自动重试 ${ev.attempt}/${ev.maxAttempts}`, trunc(ev.errorMessage, 200));
+      break;
+    case "auto_retry_end":
+      logPi("🔁", `重试 ${ev.success ? "✅成功" : "❌失败"}（第 ${ev.attempt} 次）`, ev.success ? "" : trunc(ev.finalError, 200));
+      break;
+    case "extension_error":
+      logPi("⚠️", `扩展错误 [${ev.event}]`, trunc(ev.error, 300));
+      break;
+    default:
+      break;
+  }
+}
+
+// ============================================================================
 // pi RPC 客户端
 // ============================================================================
 
 function sendRpc(obj) {
   if (!piProc) return;
   piProc.stdin.write(JSON.stringify(obj) + "\n");
+}
+
+function sendPromptRpc(message) {
+  logPi("📨", "发送 prompt", trunc(message, 200));
+  sendRpc({
+    type: "prompt",
+    message,
+    ...(isStreaming ? { streamingBehavior: "follow_up" } : {}),
+  });
 }
 
 function startPi() {
@@ -307,6 +626,8 @@ function onPiEvent(line) {
   let ev;
   try { ev = JSON.parse(line); } catch { return; }
 
+  logPiEvent(ev);
+
   switch (ev.type) {
     case "agent_start":
       isStreaming = true;
@@ -336,16 +657,9 @@ function onPiEvent(line) {
 function handleAgentEnd(ev) {
   const target = replyQueue.shift();
   if (!target || !isConnected) return;
-  const messages = ev.messages ?? [];
-  let text = "";
-  for (const m of messages) {
-    if (m.role !== "assistant") continue;
-    let t = "";
-    for (const c of m.content ?? []) if (c.type === "text") t += c.text;
-    if (t.trim()) text = t.trim();
-  }
-  if (!text || text.startsWith("[微信消息]")) return;
-  sendWeixinMsg(target.userId, text, target.contextToken).catch(() => {});
+  const text = lastAssistantText(ev.messages ?? []);
+  if (!text) return;
+  sendWeixinMsgChunked(target.userId, text, target.contextToken).catch(() => {});
 }
 
 // ============================================================================
@@ -367,17 +681,13 @@ async function onWeixinMessage(msg, savedCtx) {
   // 其他斜杠命令：作为 prompt 发送（扩展命令会被 pi 执行；内置命令无效但不报错）
   if (msg.text.startsWith("/")) {
     replyQueue.push({ userId: msg.userId, contextToken });
-    sendRpc({ type: "prompt", message: msg.text, ...(isStreaming ? { streamingBehavior: "follow_up" } : {}) });
+    sendPromptRpc(msg.text);
     return;
   }
 
   // 普通消息
   replyQueue.push({ userId: msg.userId, contextToken });
-  sendRpc({
-    type: "prompt",
-    message: `[微信消息] ${msg.text}`,
-    ...(isStreaming ? { streamingBehavior: "follow_up" } : {}),
-  });
+  sendPromptRpc(msg.text);
 }
 
 // ============================================================================
