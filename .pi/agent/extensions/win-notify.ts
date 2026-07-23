@@ -1,12 +1,15 @@
 /**
- * WSL Notify Extension
+ * Windows Notify Extension
  *
  * 当 pi 完成任务、或需要你确认（例如 question 工具提问）时，
- * 如果你已经切出 Windows Terminal，就通过 Windows 气泡通知提醒你。
+ * 如果你已经切出终端，就通过 Windows 气泡通知提醒你。
+ *
+ * 适用于 WSL（通过 powershell.exe 互操作）以及原生 Windows（直接调用 PowerShell），
+ * 两种环境下均已验证可正常工作。
  *
  * 通知逻辑移植自 notify_agent.sh（已测试可用），但不再依赖该脚本：
  *   1. 用 Win32 GetForegroundWindow 取得前台窗口的进程名
- *   2. 若前台不是 Windows Terminal（即你已切出），弹 System.Windows.Forms 气泡通知
+ *   2. 若前台不是配置的终端进程（即你已切出），弹 System.Windows.Forms 气泡通知
  * 整个“检测 + 通知”合并成一次 powershell 调用，避免双倍进程开销。
  *
  * 触发场景：

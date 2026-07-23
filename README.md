@@ -13,7 +13,7 @@ My [pi coding agent](https://github.com/badlogic/pi-mono) configuration — cust
 │   ├── question.ts        # 结构化多问题 UI（chips、多选、预览）
 │   ├── todo.ts            # 4 状态任务管理 + overlay widget（/todos 命令）
 │   ├── web-fetch.ts       # URL 抓取转 markdown，含 SSRF 防护
-│   └── wsl-notify.ts      # WSL 下 Windows 气泡通知（切出终端时提醒）
+│   └── win-notify.ts      # Windows 气泡通知（切出终端时提醒，WSL/原生 Windows 通用）
 ├── prompts/
 │   └── handoff.md         # 会话交接 prompt（替代上下文压缩）
 └── skills/
@@ -53,11 +53,11 @@ pi install npm:@gotgenes/pi-subagents
 | `web-fetch.ts` | 抓取 URL 内容并转为 markdown/text/html，内置大小限制和安全防护 |
 | `grep-find.ts` | session 启动时自动激活 grep、find 工具 |
 | `model-patches.ts` | 为 `ali/qwen3.7-max` 注入 xhigh reasoning prompt |
-| `wsl-notify.ts` | WSL 下检测前台窗口，切出 Windows Terminal 时弹气泡通知 |
+| `win-notify.ts` | 检测前台窗口，切出终端时弹 Windows 气泡通知（WSL/原生 Windows 通用） |
 
-## WSL Notify
+## Windows Notify
 
-`wsl-notify.ts` 在 WSL 环境下通过 PowerShell 发送 Windows 气泡通知。当 pi 完成任务（`agent_settled`）或向你提问（`question` 工具调用）时，如果你已切出 Windows Terminal，就会弹出通知提醒你。
+`win-notify.ts` 通过 PowerShell 发送 Windows 气泡通知，兼容 WSL（经 `powershell.exe` 互操作）与原生 Windows 两种环境。当 pi 完成任务（`agent_settled`）或向你提问（`question` 工具调用）时，如果你已切出终端，就会弹出通知提醒你。
 
 整个检测 + 通知合并为一次 PowerShell 调用，前台是终端时静默跳过，不影响 pi 正常工作。
 
