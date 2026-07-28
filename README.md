@@ -9,7 +9,6 @@ My [pi coding agent](https://github.com/badlogic/pi-mono) configuration — cust
 ├── AGENTS.md              # Karpathy 风格的 agent 行为准则
 ├── extensions/            # 自定义扩展
 │   ├── grep-find.ts       # 确保 grep、find 工具始终激活
-│   ├── model-patches.ts   # 模型级 patch（qwen3.7-max xhigh reasoning）
 │   ├── question.ts        # 结构化多问题 UI（chips、多选、预览）
 │   ├── todo.ts            # 4 状态任务管理 + overlay widget（/todos 命令）
 │   ├── web-fetch.ts       # URL 抓取转 markdown，含 SSRF 防护
@@ -52,7 +51,6 @@ pi install npm:@gotgenes/pi-subagents
 | `question.ts` | 结构化提问工具，支持单选/多选/自由输入，带预览面板 |
 | `web-fetch.ts` | 抓取 URL 内容并转为 markdown/text/html，内置大小限制和安全防护 |
 | `grep-find.ts` | session 启动时自动激活 grep、find 工具 |
-| `model-patches.ts` | 为 `ali/qwen3.7-max` 注入 xhigh reasoning prompt |
 | `win-notify.ts` | 检测前台窗口，切出终端时弹 Windows 气泡通知（WSL/原生 Windows 通用） |
 
 ## Windows Notify
