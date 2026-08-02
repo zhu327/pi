@@ -10,6 +10,7 @@ My [pi coding agent](https://github.com/badlogic/pi-mono) configuration — cust
 ├── extensions/            # 自定义扩展
 │   ├── grep-find.ts       # 确保 grep、find 工具始终激活
 │   ├── question.ts        # 结构化多问题 UI（chips、多选、预览）
+│   ├── token-rate.ts       # 实时显示 token 输出速率（tok/s）
 │   ├── todo.ts            # 4 状态任务管理 + overlay widget（/todos 命令）
 │   ├── web-fetch.ts       # URL 抓取转 markdown，含 SSRF 防护
 │   └── win-notify.ts      # Windows 气泡通知（切出终端时提醒，WSL/原生 Windows 通用）
@@ -47,6 +48,7 @@ pi install npm:@gotgenes/pi-subagents
 
 | Extension | Description |
 |-----------|-------------|
+| `token-rate.ts` | 在状态栏实时显示 token 输出速率（tok/s），基于 `before_provider_request` / `message_end` 事件计算 |
 | `todo.ts` | `/todos` 命令，pending → in_progress → completed 的任务管理，带 TUI overlay |
 | `question.ts` | 结构化提问工具，支持单选/多选/自由输入，带预览面板 |
 | `web-fetch.ts` | 抓取 URL 内容并转为 markdown/text/html，内置大小限制和安全防护 |
