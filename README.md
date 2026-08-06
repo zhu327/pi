@@ -8,7 +8,7 @@ My [pi coding agent](https://github.com/badlogic/pi-mono) configuration — cust
 .pi/agent/
 ├── AGENTS.md              # Karpathy 风格的 agent 行为准则
 ├── extensions/            # 自定义扩展
-│   ├── grep-find.ts       # 确保 grep、find 工具始终激活
+│   ├── ls-grep-find.ts     # 确保 ls、grep、find 工具始终激活
 │   ├── question.ts        # 结构化多问题 UI（chips、多选、预览）
 │   ├── token-rate.ts       # 实时显示 token 输出速率（tok/s）
 │   ├── todo.ts            # 4 状态任务管理 + overlay widget（/todos 命令）
@@ -52,7 +52,7 @@ pi install npm:@gotgenes/pi-subagents
 | `todo.ts` | `/todos` 命令，pending → in_progress → completed 的任务管理，带 TUI overlay |
 | `question.ts` | 结构化提问工具，支持单选/多选/自由输入，带预览面板 |
 | `web-fetch.ts` | 抓取 URL 内容并转为 markdown/text/html，内置大小限制和安全防护 |
-| `grep-find.ts` | session 启动时自动激活 grep、find 工具 |
+| `ls-grep-find.ts` | session 启动时自动激活 ls、grep、find 工具 |
 | `win-notify.ts` | 检测前台窗口，切出终端时弹 Windows 气泡通知（WSL/原生 Windows 通用） |
 
 ## Windows Notify
