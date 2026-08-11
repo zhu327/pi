@@ -2,7 +2,7 @@
  * Question Tool - Ask one or more structured questions
  *
  * UI refreshed to use an AskUserQuestion-style boxed dialog with chips,
- * preview split panes, notes/custom text editor, and review submit tab.
+ * notes/custom text editor, and review submit tab.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -17,7 +17,6 @@ interface QuestionOption {
 	value: string;
 	label: string;
 	description?: string;
-	preview?: string;
 }
 
 interface Question {
@@ -36,7 +35,6 @@ interface Answer {
 	wasCustom: boolean;
 	index?: number;
 	notes?: string;
-	preview?: string;
 }
 
 interface QuestionnaireResult {
@@ -57,7 +55,6 @@ const QuestionOptionSchema = Type.Object({
 	value: Type.Optional(Type.String({ description: "The value returned when selected. Optional: if omitted, defaults to the option's label, so you usually only need to provide `label`." })),
 	label: Type.String({ description: "Display label for the option (1-5 words, max 60 chars)" }),
 	description: Type.Optional(Type.String({ description: "Explanation of what this option means or what will happen if chosen" })),
-	preview: Type.Optional(Type.String({ description: "Optional preview content (markdown/code) shown next to options when focused" })),
 });
 
 const QuestionSchema = Type.Object({
@@ -69,7 +66,7 @@ const QuestionSchema = Type.Object({
 	),
 	prompt: Type.String({ description: "The complete question to ask the user. Should be clear, specific, and end with a question mark." }),
 	options: Type.Optional(Type.Array(QuestionOptionSchema, { description: "Available choices (2-4 options). If omitted, the question is a free-text input." })),
-	allowOther: Type.Optional(Type.Boolean({ description: "Allow 'Type something.' fallback (default: true, suppressed when multiSelect or any option has preview)" })),
+	allowOther: Type.Optional(Type.Boolean({ description: "Allow 'Type something.' fallback (default: true, suppressed when multiSelect)" })),
 	multiSelect: Type.Optional(Type.Boolean({ description: "Allow selecting multiple options (default: false)" })),
 });
 
@@ -112,7 +109,6 @@ function formatQuestionsAsText(questions: Question[]): string {
 				const valuePart = opt.value !== opt.label ? ` (value: ${opt.value})` : "";
 				let line = `  ${i + 1}. ${opt.label}${valuePart}`;
 				if (opt.description) line += ` — ${opt.description}`;
-				if (opt.preview) line += ` [has preview]`;
 				lines.push(line);
 			}
 			if (q.allowOther) lines.push(`  ${q.options.length + 1}. (type your own answer)`);
@@ -168,19 +164,6 @@ function answerDisplayText(answer: string): string {
 	return answer === "" ? "(empty answer)" : answer;
 }
 
-function plainPreviewLines(text: string, width: number): string[] {
-	const lines: string[] = [];
-	for (const sourceLine of text.split("\n")) {
-		const wrapped = wrapTextWithAnsi(sourceLine || " ", Math.max(1, width));
-		lines.push(...(wrapped.length > 0 ? wrapped : [""]));
-	}
-	return lines.length > 0 ? lines : [""];
-}
-
-function optionHasPreview(question: Question): boolean {
-	return !question.multiSelect && question.options.some((option) => option.preview !== undefined);
-}
-
 function missingQuestionLabels(questions: Question[], answers: Map<number, Answer>): string[] {
 	return questions.filter((_question, index) => !answers.has(index)).map((question) => question.label);
 }
@@ -219,14 +202,13 @@ export default function question(pi: ExtensionAPI) {
 		name: "question",
 		label: "Question",
 		description:
-			"Ask the user one or more structured questions during execution. Use when you need to gather preferences, clarify requirements, get decisions, or offer choices. Users can select options, type custom answers, add notes, and chat about questions. Multi-select and preview support available.",
+			"Ask the user one or more structured questions during execution. Use when you need to gather preferences, clarify requirements, get decisions, or offer choices. Users can select options, type custom answers, add notes, and chat about questions. Multi-select support available.",
 		promptSnippet: `Ask the user up to ${MAX_QUESTIONS} structured questions when requirements are ambiguous`,
 		promptGuidelines: [
 			`Use question when the user's request is underspecified and you cannot proceed without concrete decisions — group up to ${MAX_QUESTIONS} questions into one invocation.`,
 			`For multiple-choice questions, provide ${MIN_OPTIONS}-${MAX_OPTIONS} concise options. Omit options only when a free-text answer is required.`,
 			"Do not author reserved labels yourself: Other, Type something., Chat about this, or Next. The UI adds sentinel rows automatically.",
-			"Use multiSelect:true only when multiple answers are valid; this suppresses the free-text fallback. Any option preview also suppresses the free-text fallback.",
-			"Use option previews for concrete artifacts that benefit from visual comparison, such as mockups, code snippets, diagrams, or configs.",
+			"Use multiSelect:true only when multiple answers are valid; this suppresses the free-text fallback.",
 		],
 		parameters: QuestionnaireParams,
 
@@ -253,13 +235,12 @@ export default function question(pi: ExtensionAPI) {
 			const questions: Question[] = params.questions.map((q, i) => {
 				const options = (q.options ?? []).map((opt) => ({ ...opt, value: opt.value ?? opt.label }));
 				const multiSelect = q.multiSelect ?? false;
-				const hasPreview = options.some((opt) => !!opt.preview);
 				return {
 					id: q.id,
 					label: q.label || `Q${i + 1}`,
 					prompt: q.prompt,
 					options,
-					allowOther: !multiSelect && !hasPreview && q.allowOther !== false,
+					allowOther: !multiSelect && q.allowOther !== false,
 					multiSelect,
 				};
 			});
@@ -371,7 +352,6 @@ export default function question(pi: ExtensionAPI) {
 								label: option.label,
 								wasCustom: false,
 								index: index + 1,
-								preview: option.preview,
 								notes,
 							};
 						}
@@ -697,23 +677,6 @@ export default function question(pi: ExtensionAPI) {
 							return lines.map((line) => truncateToWidth(line, width));
 						}
 
-						function renderPreviewLayout(lines: string[], question: Question, innerWidth: number) {
-							const leftWidth = Math.max(24, Math.min(38, Math.floor((innerWidth - 3) * 0.42)));
-							const rightWidth = Math.max(12, innerWidth - leftWidth - 3);
-							const options = currentOptions();
-							const previewText = options[optionIndex]?.preview ?? "No preview for this option.";
-							const leftLines = optionLines(question, leftWidth);
-							const rightLines = plainPreviewLines(previewText, rightWidth - 2).map((line) => theme.fg("text", line));
-							const rows = Math.max(leftLines.length, rightLines.length);
-
-							addBoxLine(lines, `${theme.fg("accent", "Options")}${" ".repeat(Math.max(1, leftWidth - 7))}   ${theme.fg("accent", "Preview")}`, innerWidth);
-							for (let i = 0; i < rows; i++) {
-								const left = padAnsi(leftLines[i] ?? "", leftWidth);
-								const right = padAnsi(rightLines[i] ?? "", rightWidth);
-								addBoxLine(lines, `${left} ${theme.fg("muted", "│")} ${right}`, innerWidth);
-							}
-						}
-
 						function renderSubmitPickerRow(index: number, label: string): string {
 							const focused = submitPickerIndex === index;
 							const prefix = focused ? theme.fg("accent", "› ") : "  ";
@@ -783,8 +746,6 @@ export default function question(pi: ExtensionAPI) {
 							} else if (inputMode) {
 								addBoxLine(lines, theme.fg("accent", inputMode === "other" ? "Custom answer:" : "Notes:"), innerWidth);
 								for (const editorLine of editor.render(innerWidth)) addBoxLine(lines, editorLine, innerWidth);
-							} else if (optionHasPreview(question)) {
-								renderPreviewLayout(lines, question, innerWidth);
 							} else {
 								for (const line of optionLines(question, innerWidth)) addBoxLine(lines, line, innerWidth);
 							}
