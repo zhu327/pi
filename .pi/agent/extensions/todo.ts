@@ -1,6 +1,6 @@
 /**
  * Todo Extension — Task management with 4-state lifecycle, dependencies,
- * persistent overlay widget, and improved rendering.
+ * persistent overlay widget, and improved rendering. Single file.
  *
  * Upgrades from the basic version:
  * - 4 status states: pending → in_progress → completed, plus deleted tombstone
@@ -14,11 +14,21 @@
  * State is stored in tool result details (not external files), which allows
  * proper branching — when you branch, the todo state is automatically
  * correct for that point in history.
+ *
+ * REFACTOR_PLAN.md tasks implemented: T-1 (sequential execution), T-2
+ * (single in_progress), T-3 (blockedBy gates transitions), T-4 (delete
+ * checks reverse deps), T-5 (overlay prioritizes active tasks), T-6
+ * (widget lifecycle: invalidate only clears cache, reconcile unmounts),
+ * T-7 (update normalizes subject), T-8 (deleted tombstone immutable),
+ * T-9 (domain errors throw → isError=true) plus extras: activeForm
+ * required on in_progress, Integer id schema with minimum, blockedBy
+ * dedupe, dependsOn status display, renderCall free of mutable state,
+ * typed ExtensionUIContext/TUI/Component overlay.
  */
 
 import { StringEnum } from "@earendil-works/pi-ai";
-import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
-import { matchesKey, Text, truncateToWidth } from "@earendil-works/pi-tui";
+import type { ExtensionAPI, ExtensionContext, ExtensionUIContext, Theme } from "@earendil-works/pi-coding-agent";
+import { matchesKey, Text, truncateToWidth, type Component, type TUI } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 // ---------------------------------------------------------------------------
@@ -41,7 +51,6 @@ interface TaskDetails {
 	params: Record<string, unknown>;
 	tasks: Task[];
 	nextId: number;
-	error?: string;
 }
 
 type TaskAction = "create" | "update" | "list" | "get" | "delete" | "clear";
@@ -130,9 +139,11 @@ function detectCycle(tasks: readonly Task[], taskId: number, newBlockedBy: reado
 	return false;
 }
 
+/** task id → ids of non-deleted tasks that depend on it. */
 function deriveBlocks(tasks: readonly Task[]): Map<number, number[]> {
 	const blocks = new Map<number, number[]>();
 	for (const t of tasks) {
+		if (t.status === "deleted") continue;
 		for (const dep of t.blockedBy ?? []) {
 			const arr = blocks.get(dep) ?? [];
 			arr.push(t.id);
@@ -191,23 +202,70 @@ function errorResult(state: TaskState, message: string): ApplyResult {
 	return { state, op: { kind: "error", message } };
 }
 
+function normalizeSubject(value: unknown): string {
+	return typeof value === "string" ? value.trim() : "";
+}
+
+function normalizeActiveForm(value: unknown): string {
+	return typeof value === "string" ? value.trim() : "";
+}
+
+/** Validate and dedupe a list of task ids; null when any entry is invalid. */
+function normalizeIds(value: unknown): number[] | null {
+	if (!Array.isArray(value)) return null;
+	const ids: number[] = [];
+	for (const item of value) {
+		if (typeof item !== "number" || !Number.isInteger(item) || item < 1) return null;
+		if (!ids.includes(item)) ids.push(item);
+	}
+	return ids;
+}
+
+/** T-3: transitioning into in_progress/completed requires all blockers completed. */
+function checkBlockersForTransition(tasks: readonly Task[], blockedBy: readonly number[]): string | undefined {
+	const outstanding: string[] = [];
+	for (const dep of blockedBy) {
+		const depTask = tasks.find((t) => t.id === dep);
+		if (!depTask || depTask.status === "deleted") {
+			outstanding.push(`#${dep} (missing or deleted)`);
+			continue;
+		}
+		if (depTask.status !== "completed") outstanding.push(`#${dep} (${depTask.status})`);
+	}
+	if (outstanding.length === 0) return undefined;
+	return `blocked by unfinished dependencies: ${outstanding.join(", ")}`;
+}
+
+/** T-2: at most one non-deleted task may be in_progress at a time. */
+function findOtherInProgress(tasks: readonly Task[], selfId: number): Task | undefined {
+	return tasks.find((t) => t.status === "in_progress" && t.id !== selfId);
+}
+
 function applyMutation(state: TaskState, action: TaskAction, params: Record<string, unknown>): ApplyResult {
 	switch (action) {
 		case "create": {
-			const subject = (params.subject as string | undefined)?.trim();
+			const subject = normalizeSubject(params.subject);
 			if (!subject) return errorResult(state, "subject required for create");
-			const blockedBy = params.blockedBy as number[] | undefined;
-			if (blockedBy?.length) {
-				for (const dep of blockedBy) {
-					const depTask = state.tasks.find((t) => t.id === dep);
-					if (!depTask) return errorResult(state, `blockedBy: #${dep} not found`);
-					if (depTask.status === "deleted") return errorResult(state, `blockedBy: #${dep} is deleted`);
-				}
+			// Create always starts pending — reject a status instead of silently
+			// ignoring it (the model would believe the task has that status).
+			if (params.status !== undefined) {
+				return errorResult(state, "status is not valid for create; new tasks always start as pending");
+			}
+			// 附加: dedupe blockedBy ids on create (the schema's uniqueItems
+				// already rejects duplicates on the model path; direct callers get dedupe).
+			const blockedBy = params.blockedBy !== undefined ? normalizeIds(params.blockedBy) : [];
+			if (blockedBy === null) {
+				return errorResult(state, "blockedBy must be an array of positive integer task ids");
+			}
+			for (const dep of blockedBy) {
+				const depTask = state.tasks.find((t) => t.id === dep);
+				if (!depTask) return errorResult(state, `blockedBy: #${dep} not found`);
+				if (depTask.status === "deleted") return errorResult(state, `blockedBy: #${dep} is deleted`);
 			}
 			const newTask: Task = { id: state.nextId, subject, status: "pending" };
 			if (params.description) newTask.description = params.description as string;
-			if (params.activeForm) newTask.activeForm = params.activeForm as string;
-			if (blockedBy?.length) newTask.blockedBy = [...blockedBy];
+			if (params.activeForm) newTask.activeForm = normalizeActiveForm(params.activeForm);
+			if (blockedBy.length) newTask.blockedBy = blockedBy;
 			return {
 				state: { tasks: [...state.tasks, newTask], nextId: state.nextId + 1 },
 				op: { kind: "create", taskId: newTask.id },
@@ -220,20 +278,49 @@ function applyMutation(state: TaskState, action: TaskAction, params: Record<stri
 			if (idx === -1) return errorResult(state, `#${params.id} not found`);
 			const current = state.tasks[idx];
 
+			// T-8: deleted tombstones are immutable; there is no restore
+			// action (by design), so reject every mutation.
+			if (current.status === "deleted") {
+				return errorResult(state, `#${current.id} is deleted and cannot be modified`);
+			}
+
 			const hasMutation =
 				params.subject !== undefined ||
 				params.description !== undefined ||
 				params.activeForm !== undefined ||
 				params.status !== undefined ||
-				(params.addBlockedBy && (params.addBlockedBy as number[]).length > 0) ||
-				(params.removeBlockedBy && (params.removeBlockedBy as number[]).length > 0);
+				(params.addBlockedBy && (params.addBlockedBy as unknown[]).length > 0) ||
+				(params.removeBlockedBy && (params.removeBlockedBy as unknown[]).length > 0);
 			if (!hasMutation) return errorResult(state, "update requires at least one mutable field");
 
-			let newStatus = current.status;
+			let newStatus: TaskStatus = current.status;
 			if (params.status !== undefined) {
 				const target = params.status as TaskStatus;
 				if (!isTransitionValid(current.status, target)) {
 					return errorResult(state, `illegal transition: ${current.status} → ${target}`);
+				}
+				// T-4 (fix): update→deleted must pass the same reverse-dependency
+				// gate as the delete action, or it would leave dangling blockedBy.
+				if (target === "deleted") {
+					const dependents = deriveBlocks(state.tasks).get(current.id) ?? [];
+					if (dependents.length > 0) {
+						return errorResult(
+							state,
+							`cannot delete #${current.id}: still referenced by ${dependents.map((id) => `#${id}`).join(", ")}; removeBlockedBy first`,
+						);
+					}
+				}
+				// T-2: at most one in_progress task at a time.
+				if (target === "in_progress" && current.status !== "in_progress") {
+					const other = findOtherInProgress(state.tasks, current.id);
+					if (other) {
+						return errorResult(state, `#${other.id} "${other.subject}" is already in_progress; only one task may be in_progress at a time`);
+					}
+					// 附加: activeForm is required when entering in_progress.
+					const form = params.activeForm !== undefined ? normalizeActiveForm(params.activeForm) : current.activeForm ?? "";
+					if (!form) {
+						return errorResult(state, "activeForm (non-empty) is required when marking a task in_progress");
+					}
 				}
 				newStatus = target;
 			}
@@ -258,10 +345,30 @@ function applyMutation(state: TaskState, action: TaskAction, params: Record<stri
 				}
 			}
 
+			// T-3 (fix): gate status transitions AND dependency edits — a task
+			// already in_progress/completed must not gain unfinished blockers.
+			const blockedByChanged =
+				(params.addBlockedBy !== undefined && (params.addBlockedBy as unknown[]).length > 0) ||
+				(params.removeBlockedBy !== undefined && (params.removeBlockedBy as unknown[]).length > 0);
+			if (
+				(newStatus === "in_progress" || newStatus === "completed") &&
+				(current.status !== newStatus || blockedByChanged)
+			) {
+				const blockerError = checkBlockersForTransition(state.tasks, newBlockedBy);
+				if (blockerError) {
+					return errorResult(state, `cannot transition to ${newStatus}: ${blockerError}`);
+				}
+			}
+
 			const updated: Task = { ...current, status: newStatus };
-			if (params.subject !== undefined) updated.subject = params.subject as string;
+			if (params.subject !== undefined) {
+				// T-7: subject updates are trimmed and must stay non-empty.
+				const trimmed = normalizeSubject(params.subject);
+				if (!trimmed) return errorResult(state, "subject cannot be empty after trimming");
+				updated.subject = trimmed;
+			}
 			if (params.description !== undefined) updated.description = params.description as string;
-			if (params.activeForm !== undefined) updated.activeForm = params.activeForm as string;
+			if (params.activeForm !== undefined) updated.activeForm = normalizeActiveForm(params.activeForm);
 			if (newBlockedBy.length) updated.blockedBy = newBlockedBy;
 			else delete updated.blockedBy;
 
@@ -297,6 +404,14 @@ function applyMutation(state: TaskState, action: TaskAction, params: Record<stri
 			if (idx === -1) return errorResult(state, `#${params.id} not found`);
 			const current = state.tasks[idx];
 			if (current.status === "deleted") return errorResult(state, `#${current.id} is already deleted`);
+			// T-4: never leave dangling blockedBy references behind.
+			const dependents = deriveBlocks(state.tasks).get(current.id) ?? [];
+			if (dependents.length > 0) {
+				return errorResult(
+					state,
+					`cannot delete #${current.id}: still referenced by ${dependents.map((id) => `#${id}`).join(", ")}; removeBlockedBy first`,
+				);
+			}
 			const updated: Task = { ...current, status: "deleted" };
 			const newTasks = [...state.tasks];
 			newTasks[idx] = updated;
@@ -312,6 +427,10 @@ function applyMutation(state: TaskState, action: TaskAction, params: Record<stri
 				op: { kind: "clear", count: state.tasks.length },
 			};
 		}
+
+		default:
+			// Unknown actions (schema bypass) are domain errors, not crashes.
+			return errorResult(state, `unknown action: ${String(action)}`);
 	}
 }
 
@@ -330,7 +449,17 @@ function formatGetLines(task: Task, state: TaskState): string {
 	const lines = [`#${task.id} [${task.status}] ${task.subject}`];
 	if (task.description) lines.push(`  description: ${task.description}`);
 	if (task.activeForm) lines.push(`  activeForm: ${task.activeForm}`);
-	if (task.blockedBy?.length) lines.push(`  blockedBy: ${task.blockedBy.map((id) => `#${id}`).join(", ")}`);
+	if (task.blockedBy?.length) {
+		// 附加: show each dependency's state so "dependsOn" is distinguishable
+		// from "currently blocked".
+		const deps = task.blockedBy
+			.map((id) => {
+				const dep = state.tasks.find((t) => t.id === id);
+				return dep ? `#${id} (${dep.status})` : `#${id} (missing)`;
+			})
+			.join(", ");
+		lines.push(`  dependsOn: ${deps}`);
+	}
 	if (blocks.length) lines.push(`  blocks: ${blocks.map((id) => `#${id}`).join(", ")}`);
 	return lines.join("\n");
 }
@@ -369,11 +498,12 @@ function formatContent(op: Op, state: TaskState): string {
 
 const TodoParams = Type.Object({
 	action: StringEnum(["create", "update", "list", "get", "delete", "clear"] as const),
-	subject: Type.Optional(Type.String({ description: "Task subject line (required for create)" })),
-	description: Type.Optional(Type.String({ description: "Long-form task description" })),
+	subject: Type.Optional(Type.String({ description: "Task subject line (required for create)", maxLength: 200 })),
+	description: Type.Optional(Type.String({ description: "Long-form task description", maxLength: 10_000 })),
 	activeForm: Type.Optional(
 		Type.String({
 			description: "Present-continuous label shown while in_progress (e.g. 'writing tests')",
+			maxLength: 120,
 		}),
 	),
 	status: Type.Optional(
@@ -382,16 +512,25 @@ const TodoParams = Type.Object({
 		}),
 	),
 	blockedBy: Type.Optional(
-		Type.Array(Type.Number(), { description: "Initial blockedBy ids (create only)" }),
+		Type.Array(Type.Integer({ minimum: 1 }), {
+			uniqueItems: true,
+			description: "Initial blockedBy ids (create only)",
+		}),
 	),
 	addBlockedBy: Type.Optional(
-		Type.Array(Type.Number(), { description: "Task ids to add to blockedBy (update only, additive merge)" }),
+		Type.Array(Type.Integer({ minimum: 1 }), {
+			uniqueItems: true,
+			description: "Task ids to add to blockedBy (update only, additive merge)",
+		}),
 	),
 	removeBlockedBy: Type.Optional(
-		Type.Array(Type.Number(), { description: "Task ids to remove from blockedBy (update only)" }),
+		Type.Array(Type.Integer({ minimum: 1 }), {
+			uniqueItems: true,
+			description: "Task ids to remove from blockedBy (update only)",
+		}),
 	),
 	id: Type.Optional(
-		Type.Number({ description: "Task id (required for update, get, delete)" }),
+		Type.Integer({ description: "Task id (required for update, get, delete)", minimum: 1 }),
 	),
 	includeDeleted: Type.Optional(
 		Type.Boolean({ description: "If true, list includes deleted tasks. Default: false." }),
@@ -405,23 +544,32 @@ const TodoParams = Type.Object({
 const WIDGET_KEY = "todo-overlay";
 const MAX_WIDGET_LINES = 12;
 
+interface WidgetRenderCache {
+	width: number;
+	generation: number;
+	lines: string[];
+}
+
 class TodoOverlay {
-	private uiCtx: { setWidget: (key: string, factory: unknown, opts?: unknown) => void } | undefined;
+	private uiCtx: ExtensionUIContext | undefined;
 	private widgetRegistered = false;
-	private tui: { requestRender: () => void } | undefined;
+	private tui: TUI | undefined;
 	private currentState: TaskState = { tasks: [], nextId: 1 };
 	private theme: Theme | undefined;
 	// Two-phase auto-hide: completed tasks stay visible until the next agent
 	// turn starts, then disappear. When all tasks are hidden, the widget unmounts.
 	private completedTaskIdsPendingHide = new Set<number>();
 	private hiddenCompletedTaskIds = new Set<number>();
+	// T-6: invalidate() only clears this cache; lifecycle stays with update()/dispose().
+	private cache: WidgetRenderCache | undefined;
+	private generation = 0;
 
-	setUICtx(ctx: unknown): void {
-		const typed = ctx as TodoOverlay["uiCtx"];
-		if (typed !== this.uiCtx) {
-			this.uiCtx = typed;
+	setUICtx(ctx: ExtensionUIContext | undefined): void {
+		if (ctx !== this.uiCtx) {
+			this.uiCtx = ctx;
 			this.widgetRegistered = false;
 			this.tui = undefined;
+			this.cache = undefined;
 		}
 	}
 
@@ -436,6 +584,7 @@ class TodoOverlay {
 			this.hiddenCompletedTaskIds.add(id);
 		}
 		this.completedTaskIdsPendingHide.clear();
+		this.generation += 1;
 		this.tui?.requestRender();
 	}
 
@@ -461,12 +610,16 @@ class TodoOverlay {
 		if (!this.uiCtx) return;
 		this.currentState = nextState;
 		this.syncHiddenSets();
+		this.generation += 1;
 		const visible = this.selectOverlayVisible();
 		if (visible.length === 0) {
+			// T-6: reconcile — when nothing is visible the widget is really
+			// unmounted, not just marked registered=false.
 			if (this.widgetRegistered) {
 				this.uiCtx.setWidget(WIDGET_KEY, undefined);
 				this.widgetRegistered = false;
 				this.tui = undefined;
+				this.cache = undefined;
 			}
 			return;
 		}
@@ -474,14 +627,15 @@ class TodoOverlay {
 		if (!this.widgetRegistered) {
 			this.uiCtx.setWidget(
 				WIDGET_KEY,
-				(tui: { requestRender: () => void }, theme: Theme) => {
+				(tui: TUI, theme: Theme): Component => {
 					this.tui = tui;
 					this.theme = theme;
 					return {
 						render: (width: number) => this.renderWidget(width),
+						// T-6: invalidate only drops the render cache; it must
+						// not unregister the widget.
 						invalidate: () => {
-							this.widgetRegistered = false;
-							this.tui = undefined;
+							this.cache = undefined;
 						},
 					};
 				},
@@ -496,6 +650,9 @@ class TodoOverlay {
 	private renderWidget(width: number): string[] {
 		const theme = this.theme;
 		if (!theme) return [];
+		if (this.cache && this.cache.width === width && this.cache.generation === this.generation) {
+			return this.cache.lines;
+		}
 		this.syncHiddenSets();
 		const visible = this.selectOverlayVisible();
 		if (visible.length === 0) return [];
@@ -513,20 +670,20 @@ class TodoOverlay {
 		const maxBody = MAX_WIDGET_LINES - 1;
 		const showIds = visible.some((t) => t.blockedBy && t.blockedBy.length > 0);
 
+		// T-5: active tasks first — every non-completed task beats completed
+		// ones for screen space, and in_progress beats pending.
 		let bodyTasks: Task[];
 		let hiddenExtra = 0;
 		if (visible.length <= maxBody) {
 			bodyTasks = visible;
 		} else {
-			// Drop completed first, then truncate non-completed tail
-			const nonCompleted = visible.filter((t) => t.status !== "completed");
-			if (nonCompleted.length <= maxBody - 1) {
-				bodyTasks = visible.slice(0, maxBody - 1);
-				hiddenExtra = visible.length - (maxBody - 1);
-			} else {
-				bodyTasks = nonCompleted.slice(0, maxBody - 1);
-				hiddenExtra = visible.length - bodyTasks.length;
-			}
+			const inProgress = visible.filter((t) => t.status === "in_progress");
+			const pending = visible.filter((t) => t.status === "pending");
+			const completed = visible.filter((t) => t.status === "completed");
+			// Reserve one line for the "+N more" footer so the widget stays
+			// within MAX_WIDGET_LINES (heading + body + footer).
+			bodyTasks = [...inProgress, ...pending, ...completed].slice(0, maxBody - 1);
+			hiddenExtra = visible.length - bodyTasks.length;
 		}
 
 		for (let i = 0; i < bodyTasks.length; i++) {
@@ -540,13 +697,14 @@ class TodoOverlay {
 			lines.push(truncate(`${theme.fg("dim", "└─")} ${theme.fg("dim", `+${hiddenExtra} more`)}`));
 		}
 
-		// Track newly displayed completed tasks → mark for hiding on next agent turn
-		for (const t of visible) {
+		// Track displayed completed tasks → mark for hiding on next agent turn.
+		for (const t of bodyTasks) {
 			if (t.status === "completed" && !this.completedTaskIdsPendingHide.has(t.id) && !this.hiddenCompletedTaskIds.has(t.id)) {
 				this.completedTaskIdsPendingHide.add(t.id);
 			}
 		}
 
+		this.cache = { width, generation: this.generation, lines };
 		return lines;
 	}
 
@@ -555,6 +713,7 @@ class TodoOverlay {
 		this.widgetRegistered = false;
 		this.tui = undefined;
 		this.uiCtx = undefined;
+		this.cache = undefined;
 	}
 }
 
@@ -742,7 +901,8 @@ export default function (pi: ExtensionAPI) {
 		overlay.dispose();
 	});
 
-	// Update overlay after each todo tool call
+	// Update overlay after each todo tool call (successful ones only: domain
+	// errors now throw, so isError carries the reducer's verdict).
 	pi.on("tool_execution_end", async (event) => {
 		if (event.toolName !== "todo" || event.isError) return;
 		overlay.update(state);
@@ -770,9 +930,14 @@ export default function (pi: ExtensionAPI) {
 			"Subject must be short and imperative (e.g. 'Research existing tool'); description is for long-form detail. activeForm is a present-continuous label shown while in_progress.",
 		],
 		parameters: TodoParams,
+		// T-1: shared mutable state + parallel execution would race.
+		executionMode: "sequential",
 
 		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
 			const result = applyMutation(state, params.action, params as Record<string, unknown>);
+			// T-9: domain errors throw so the tool result carries
+			// isError=true; state is only advanced on success.
+			if (result.op.kind === "error") throw new Error(result.op.message);
 			state = result.state;
 			const text = formatContent(result.op, state);
 			const details: TaskDetails = {
@@ -780,7 +945,6 @@ export default function (pi: ExtensionAPI) {
 				params: params as Record<string, unknown>,
 				tasks: state.tasks,
 				nextId: state.nextId,
-				...(result.op.kind === "error" ? { error: result.op.message } : {}),
 			};
 			return { content: [{ type: "text", text }], details };
 		},
@@ -789,14 +953,14 @@ export default function (pi: ExtensionAPI) {
 			const glyph = ACTION_GLYPH[args.action as TaskAction] ?? args.action;
 			let text = theme.fg("toolTitle", theme.bold("todo ")) + theme.fg("muted", glyph);
 
+			// No mutable-state reads here: args are the only source.
 			if (args.action === "create" && args.subject) {
 				text += ` ${theme.fg("dim", args.subject as string)}`;
 			} else if (
 				(args.action === "update" || args.action === "get" || args.action === "delete") &&
 				args.id !== undefined
 			) {
-				const subject = state.tasks.find((t) => t.id === args.id)?.subject;
-				text += ` ${theme.fg("accent", subject ?? `#${args.id}`)}`;
+				text += ` ${theme.fg("accent", `#${args.id}`)}`;
 			} else if (args.action === "list" && args.status) {
 				text += ` ${theme.fg("muted", STATUS_LABEL[args.status as TaskStatus] ?? (args.status as string))}`;
 			}
@@ -808,9 +972,6 @@ export default function (pi: ExtensionAPI) {
 			if (!details) {
 				const text = result.content[0];
 				return new Text(text?.type === "text" ? text.text : "", 0, 0);
-			}
-			if (details.error) {
-				return new Text(theme.fg("error", `✗ ${details.error}`), 0, 0);
 			}
 
 			let status: TaskStatus | undefined;
