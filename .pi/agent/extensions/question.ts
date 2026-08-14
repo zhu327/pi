@@ -917,6 +917,11 @@ export default function question(pi: ExtensionAPI) {
 				const label = details.chatRequested ? "Chat requested" : "Cancelled";
 				return new Text(theme.fg("warning", label), 0, 0);
 			}
+			if (details.answers.length === 0) {
+				// Text fallback (non-TUI modes): no dialog ran, so there are no
+				// answers — render an explicit note instead of an empty row.
+				return new Text(theme.fg("dim", "questions presented as text (no interactive UI)"), 0, 0);
+			}
 			const lines = details.answers.map((a) => {
 				const qLabel = a.questionLabel || a.id;
 				if (a.wasCustom) return `${theme.fg("success", "✓ ")}${theme.fg("accent", qLabel)}: ${theme.fg("muted", "(wrote) ")}${a.label}`;

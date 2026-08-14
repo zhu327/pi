@@ -34,7 +34,6 @@ import { chmod, mkdtemp, readdir, rename, rm, stat, writeFile } from "node:fs/pr
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { lookup } from "node:dns/promises"
-import { isIP } from "node:net"
 import { createBrotliDecompress, createGunzip, inflate as zlibInflate, inflateRaw as zlibInflateRaw } from "node:zlib"
 import { request as httpRequest, type IncomingMessage } from "node:http"
 import { request as httpsRequest } from "node:https"
@@ -46,6 +45,11 @@ import { Container, Markdown, Text } from "@earendil-works/pi-tui"
 // ── Limits ───────────────────────────────────────────────────────────────────
 
 const MAX_RESPONSE_SIZE = 5 * 1024 * 1024 // 5MB captured body cap
+// Deflate bodies are buffered (zlib-vs-raw fallback) and inflated with a
+// hard output cap so a compressed bomb cannot balloon the heap. Generous
+// headroom over MAX_RESPONSE_SIZE keeps honest pages working; anything
+// bigger fails with a clear error instead of OOM.
+const DEFLATE_MAX_OUTPUT_BYTES = 32 * 1024 * 1024
 const DEFAULT_TIMEOUT_MS = 30_000
 const MAX_TIMEOUT_MS = 120_000
 const DEFAULT_MAX_CHARS = 50_000
@@ -155,7 +159,9 @@ function asWebToolError(error: unknown, fallbackCode: WebErrorCode = "http"): We
 		if (/timed? ?out/i.test(message)) return new WebToolError("timeout", message)
 		if (/too (large|big)/i.test(message)) return new WebToolError("too_large", message)
 		if (/redirect/i.test(message)) return new WebToolError("too_many_redirects", message)
-		if (/private|loopback|ssrf|refus/i.test(message)) return new WebToolError("ssrf_blocked", message)
+		// Note: "refused" (ECONNREFUSED) is a plain connection failure and must
+		// stay classified as http, not ssrf_blocked.
+		if (/private|loopback|ssrf/i.test(message)) return new WebToolError("ssrf_blocked", message)
 		return new WebToolError(fallbackCode, message)
 	}
 	return new WebToolError(fallbackCode, String(error))
@@ -177,32 +183,77 @@ function isPrivateOrLoopbackIpv4(raw: string): boolean {
 	if (a === 172 && b >= 16 && b <= 31) return true // private
 	if (a === 192 && b === 168) return true // private
 	if (a === 100 && b >= 64 && b <= 127) return true // CGNAT 100.64/10
-	if (a === 192 && (b === 0 || b === 0x7f || (b === 88 && octets[2] === 99))) return true // documentation
+	if (a === 192 && b === 88 && octets[2] === 99) return true // 6to4 relay anycast 192.88.99.0/24
+	// Only 192.0.0.0/24 (IETF protocol assignments) and 192.0.2.0/24
+	// (TEST-NET-1) are special — the rest of 192.0.0.0/16 and 192.127.0.0/16
+	// are ordinary global space and must not be blocked.
+	if (a === 192 && b === 0 && (octets[2] === 0 || octets[2] === 2)) return true
 	if (a === 198 && (b === 18 || b === 19 || (b === 51 && octets[2] === 100))) return true // benchmarking
 	if (a === 203 && b === 0 && octets[2] === 113) return true // documentation
 	if (a === 192 && b === 31 && octets[2] === 196) return true // AS112
 	return false
 }
 
-function isPrivateOrLoopbackIpv6(raw: string): boolean {
+/**
+ * Expand an IPv6 literal (brackets and zone index allowed) into its eight
+ * 16-bit groups, or null when it does not parse as IPv6. Handles the
+ * deprecated dotted-quad tail ("::ffff:127.0.0.1") by rewriting it into
+ * two hex groups first.
+ */
+function expandIpv6(raw: string): number[] | null {
 	let addr = raw.toLowerCase().replace(/^\[|\]$/g, "")
+	const zone = addr.indexOf("%")
+	if (zone >= 0) addr = addr.slice(0, zone)
+	if (!addr.includes(":")) return null
 	if (addr.includes(".")) {
-		// IPv4-mapped or IPv4-compatible: validate the embedded IPv4.
-		const parts = addr.split(":")
-		return isPrivateOrLoopbackIpv4(parts[parts.length - 1] ?? "")
+		const lastColon = addr.lastIndexOf(":")
+		const quad = addr.slice(lastColon + 1).match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/)
+		if (!quad) return null
+		const octets = quad.slice(1).map(Number)
+		if (octets.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) return null
+		addr = `${addr.slice(0, lastColon + 1)}${((octets[0]! << 8) | octets[1]!).toString(16)}:${((octets[2]! << 8) | octets[3]!).toString(16)}`
 	}
-	if (!addr.includes(":") || isIP(addr) !== 6) return false
-	if (addr === "::" || addr === "::1") return true
-	const first = Number.parseInt(addr.split(":")[0] ?? "", 16)
-	if (Number.isFinite(first)) {
-		if (first >= 0xfe80 && first <= 0xfebf) return true // link-local fe80::/10
-		if (first >= 0xfc00 && first <= 0xfdff) return true // unique-local fc00::/7
-		if (first >= 0xff00) return true // multicast ff00::/8
-		if (first >= 0xfec0) return true // deprecated site-local fec0::/10
-		if (addr.startsWith("2001:db8")) return true // documentation 2001:db8::/32
-		if (first === 0x3fff) return true // documentation 3fff::/20
-		if (first === 0x0064) return true // NAT64 64:ff9b::/96 — can encode private IPv4
-		if (first === 0x2002) return true // 6to4 2002::/16 — embeds arbitrary IPv4
+	const halves = addr.split("::")
+	if (halves.length > 2) return null
+	const head = halves[0] === "" ? [] : (halves[0]!.split(":"))
+	const tail = halves.length === 2 && halves[1] !== "" ? (halves[1]!.split(":")) : []
+	const missing = 8 - head.length - tail.length
+	if (halves.length === 1 && missing !== 0) return null
+	if (halves.length === 2 && missing < 0) return null
+	const groups = [...head, ...Array.from({ length: halves.length === 2 ? missing : 0 }, () => "0"), ...tail]
+	if (groups.length !== 8) return null
+	const out: number[] = []
+	for (const group of groups) {
+		if (!/^[0-9a-f]{1,4}$/.test(group)) return null
+		out.push(Number.parseInt(group, 16))
+	}
+	return out
+}
+
+function isPrivateOrLoopbackIpv6(raw: string): boolean {
+	const groups = expandIpv6(raw)
+	// Fail-closed: something with colons that does not parse as IPv6 is
+	// refused rather than assumed public.
+	if (!groups) return true
+	const [g0, g1] = groups as [number, number, ...number[]]
+	if (g0 === 0x2002) return true // 6to4 2002::/16 — embeds arbitrary IPv4
+	if (g0 === 0x2001 && (g1 === 0x0000 || g1 === 0x0002 || g1 === 0x0db8)) return true // Teredo 2001::/32, benchmarking 2001:2::/48, documentation 2001:db8::/32
+	if (g0 === 0x0064 && g1 === 0xff9b) return true // NAT64 64:ff9b::/96 — can encode private IPv4
+	if (g0 === 0x3fff) return true // documentation 3fff::/20 (checked as /16, conservative)
+	if (g0 >= 0xfe80 && g0 <= 0xfebf) return true // link-local fe80::/10
+	if (g0 >= 0xfec0 && g0 <= 0xfeff) return true // deprecated site-local fec0::/10
+	if (g0 >= 0xfc00 && g0 <= 0xfdff) return true // unique-local fc00::/7
+	if (g0 >= 0xff00) return true // multicast ff00::/8
+	if (groups.slice(0, 5).every((g) => g === 0)) {
+		const embedded = `${groups[6]! >> 8}.${groups[6]! & 0xff}.${groups[7]! >> 8}.${groups[7]! & 0xff}`
+		if (groups[5] === 0xffff) return isPrivateOrLoopbackIpv4(embedded) // IPv4-mapped ::ffff:0:0/96
+		if (groups[5] === 0) {
+			// Unspecified, loopback (any spelling, incl. 0:0:0:0:0:0:0:1), and the
+			// deprecated IPv4-compatible ::/96 — validate the embedded IPv4.
+			if (groups[6] === 0 && groups[7] === 0) return true
+			if (groups[6] === 0 && groups[7] === 1) return true
+			return isPrivateOrLoopbackIpv4(embedded)
+		}
 	}
 	return false
 }
@@ -247,7 +298,10 @@ interface ValidatedAddress {
 async function resolveValidatedAddresses(host: string): Promise<ValidatedAddress[]> {
 	let results: Array<{ address: string; family: number }>
 	try {
-		results = await lookup(host, { all: true, verbatim: true })
+		// URL.hostname keeps brackets around IPv6 literals ("[::1]"), which
+		// dns.lookup cannot parse — strip them so public IPv6 literal URLs are
+		// usable (they were already URL-validated by parseAndAssertHttpUrl).
+		results = await lookup(host.replace(/^\[|\]$/g, ""), { all: true, verbatim: true })
 	} catch (error) {
 		throw new WebToolError("dns_failed", `DNS lookup failed for ${host}: ${error instanceof Error ? error.message : String(error)}`)
 	}
@@ -321,6 +375,14 @@ async function fetchOncePinned(url: string, headers: Record<string, string>, sig
 			(msg: IncomingMessage) => {
 				const declared = parseDeclaredLength(msg.headers["content-length"])
 				const encoding = String(msg.headers["content-encoding"] ?? "").toLowerCase()
+				const status = msg.statusCode ?? 200
+				// The fetch-spec Response constructor throws a RangeError on
+				// null-body statuses (204/205/304) when given a body, and on any
+				// status outside 200-599. A throw inside this http.request
+				// callback escapes the promise machinery (uncaughtException),
+				// so both cases are normalized here.
+				const nullBodyStatus = status === 204 || status === 205 || status === 304
+				const safeStatus = nullBodyStatus || (status >= 200 && status <= 599) ? status : status < 200 ? 200 : 599
 				const responseHeaders = new Headers()
 				for (const [key, value] of Object.entries(msg.headers)) {
 					if (value === undefined) continue
@@ -331,16 +393,25 @@ async function fetchOncePinned(url: string, headers: Record<string, string>, sig
 					else responseHeaders.set(key, String(value))
 				}
 
-				const makeResponse = (bodyStream: Readable): { response: Response; declaredLength?: number } => ({
-					response: new Response(Readable.toWeb(bodyStream) as ReadableStream, {
-						status: msg.statusCode ?? 200,
+				const makeResponse = (bodyStream: Readable | null): { response: Response; declaredLength?: number } => ({
+					response: new Response(bodyStream === null ? null : (Readable.toWeb(bodyStream) as ReadableStream), {
+						status: safeStatus,
 						statusText: msg.statusMessage ?? "",
 						headers: responseHeaders,
 					}),
 					// The declared length only pre-checks when the body is NOT
 					// re-encoded (decompressed) on our side.
-					declaredLength: encoding ? undefined : declared,
+					declaredLength: encoding || nullBodyStatus ? undefined : declared,
 				})
+
+				if (nullBodyStatus) {
+					// 204/205/304 carry no body — drain any stray bytes (socket
+					// hygiene) and hand back an empty Response instead of feeding a
+					// decompressor or body reader.
+					msg.resume()
+					resolve(makeResponse(null))
+					return
+				}
 
 				if (encoding === "deflate") {
 					// Some servers send raw (unwrapped) deflate despite the header.
@@ -354,8 +425,17 @@ async function fetchOncePinned(url: string, headers: Record<string, string>, sig
 				}
 
 				let bodyStream: Readable = msg
-				if (encoding === "gzip" || encoding === "x-gzip") bodyStream = msg.pipe(createGunzip())
-				else if (encoding === "br") bodyStream = msg.pipe(createBrotliDecompress())
+				if (encoding === "gzip" || encoding === "x-gzip") {
+					const decoder = createGunzip()
+					// A corrupt stream must not leave the source socket dangling
+					// until keep-alive expiry — destroy it when the transform fails.
+					decoder.on("error", () => msg.destroy())
+					bodyStream = msg.pipe(decoder)
+				} else if (encoding === "br") {
+					const decoder = createBrotliDecompress()
+					decoder.on("error", () => msg.destroy())
+					bodyStream = msg.pipe(decoder)
+				}
 				resolve(makeResponse(bodyStream))
 			},
 		)
@@ -394,13 +474,16 @@ async function decompressDeflate(msg: IncomingMessage): Promise<Buffer> {
 		chunks.push(buffer)
 	}
 	const compressed = Buffer.concat(chunks)
+	// maxOutputLength bounds the decompressed size — without it a few MB of
+	// malicious "deflate" can inflate into GBs of heap (zip bomb).
+	const inflateOptions = { maxOutputLength: DEFLATE_MAX_OUTPUT_BYTES }
 	return await new Promise<Buffer>((resolve, reject) => {
-		zlibInflate(compressed, (error, out) => {
+		zlibInflate(compressed, inflateOptions, (error, out) => {
 			if (!error) return resolve(out)
-		zlibInflateRaw(compressed, (rawError, rawOut) => {
-			if (!rawError) return resolve(rawOut)
-			reject(new WebToolError("http", `Failed to decompress deflate response: ${rawError.message}`))
-		})
+			zlibInflateRaw(compressed, inflateOptions, (rawError, rawOut) => {
+				if (!rawError) return resolve(rawOut)
+				reject(new WebToolError("http", `Failed to decompress deflate response: ${rawError.message}`))
+			})
 		})
 	})
 }
@@ -420,7 +503,9 @@ async function fetchFollowingRedirects(
 	signal: AbortSignal,
 ): Promise<{ response: Response; finalUrl: string; declaredLength?: number }> {
 	let currentUrl = url
-	for (let redirects = 0; redirects <= MAX_REDIRECTS; redirects++) {
+	// Every iteration returns or throws; the counter guard below caps the
+	// hops, so the loop itself never exits normally.
+	for (let redirects = 0; ; redirects++) {
 		parseAndAssertHttpUrl(currentUrl)
 		const { response, declaredLength } = await fetchOncePinned(currentUrl, headers, signal)
 		if (!isRedirect(response)) return { response, finalUrl: currentUrl, declaredLength }
@@ -443,7 +528,6 @@ async function fetchFollowingRedirects(
 		await response.body?.cancel()
 		currentUrl = nextUrl.toString()
 	}
-	throw new WebToolError("too_many_redirects", `Too many redirects (>${MAX_REDIRECTS})`)
 }
 
 // ── HTML entity decoding ─────────────────────────────────────────────────────
@@ -812,8 +896,8 @@ function spillLabel(kind: SpillKind): string {
  * Complete-conversion truncation footer: the full converted output exists
  * and was spilled — real totals are known.
  */
-function formatCompleteTruncationFooter(totalChars: number, maxChars: number, tempFile: string, kind: SpillKind): string {
-	return `\n...[truncated]\n\n[Content truncated: showing ${maxChars.toLocaleString()} of ${totalChars.toLocaleString()} chars. ${spillLabel(kind)} saved to: ${tempFile}]`
+function formatCompleteTruncationFooter(totalChars: number, shownChars: number, tempFile: string, kind: SpillKind): string {
+	return `\n...[truncated]\n\n[Content truncated: showing ${shownChars.toLocaleString()} of ${totalChars.toLocaleString()} chars. ${spillLabel(kind)} saved to: ${tempFile}]`
 }
 
 /**
@@ -821,9 +905,9 @@ function formatCompleteTruncationFooter(totalChars: number, maxChars: number, te
  * so the "total" is only the captured prefix — the real total length is
  * unknown and the wording must not claim completeness.
  */
-function formatCapturedTruncationFooter(capturedBytes: number, maxChars: number, tempFile: string, kind: SpillKind): string {
+function formatCapturedTruncationFooter(capturedBytes: number, shownChars: number, tempFile: string, kind: SpillKind): string {
 	return (
-		`\n...[truncated]\n\n[Content truncated: showing ${maxChars.toLocaleString()} chars of the captured ` +
+		`\n...[truncated]\n\n[Content truncated: showing ${shownChars.toLocaleString()} chars of the captured ` +
 		`${formatSize(capturedBytes)} prefix. Remaining content not downloaded — true total length unknown. ` +
 		`${spillLabel(kind)} saved to: ${tempFile}]`
 	)
@@ -969,11 +1053,22 @@ interface Flight {
 	callers: Set<AbortSignal>
 }
 
+/** Lowercased hostname for per-host throttling; the raw string on parse failure. */
+function hostFromUrl(raw: string): string {
+	try {
+		return new URL(raw).hostname.toLowerCase()
+	} catch {
+		return raw
+	}
+}
+
 export interface ScheduleOptions {
 	/** Caller's composite signal (user cancellation). Detaching never kills the flight while another caller waits. */
 	signal?: AbortSignal
 	/** Flight deadline in ms, armed when the request leaves the queue (queue wait does not burn the timeout). */
 	timeoutMs?: number
+	/** Host used for the per-host concurrency limit. Pass explicitly — cache keys are not URLs, so the fallback parse cannot recover it. */
+	host?: string
 }
 
 class RequestScheduler {
@@ -1012,7 +1107,7 @@ class RequestScheduler {
 
 		const promise = new Promise<T>((resolve, reject) => {
 			this.queue.push({
-				host: RequestScheduler.hostOf(key),
+				host: opts?.host ?? RequestScheduler.hostOf(key),
 				run: () => {
 					// Abandoned while queued (every caller left) — settle without running.
 					if (controller.signal.aborted) {
@@ -1320,12 +1415,12 @@ async function executeFetch(
 				spillKind = isHtml ? "captured-raw-html" : "captured-raw-text"
 				const spill = await artifacts.spill(`content.${spillKind === "captured-raw-html" ? "html" : "txt"}`, body)
 				fullOutputPath = spill.path
-				content = bounded.content + formatCapturedTruncationFooter(capturedBytes, maxChars, fullOutputPath, spillKind)
+				content = bounded.content + formatCapturedTruncationFooter(capturedBytes, bounded.content.length, fullOutputPath, spillKind)
 			} else {
 				spillKind = format === "markdown" ? "markdown" : format === "html" ? "html" : "text"
 				const spill = await artifacts.spill(`content.${extensionForFormat(format)}`, output)
 				fullOutputPath = spill.path
-				content = bounded.content + formatCompleteTruncationFooter(output.length, maxChars, fullOutputPath, spillKind)
+				content = bounded.content + formatCompleteTruncationFooter(output.length, bounded.content.length, fullOutputPath, spillKind)
 			}
 		}
 
@@ -1435,10 +1530,12 @@ function createWebFetchTool(deps: { scheduler: RequestScheduler; artifacts: Arti
 
 			try {
 				const cacheKey = `${format}|${maxChars}|${fetchPlan.fetchUrl}`
+				// Per-host throttling needs the real hostname — the cache key is
+				// not a URL, so pass the host explicitly.
 				const { content, details } = await deps.scheduler.schedule(
 					cacheKey,
 					(flightSignal) => executeFetch(fetchPlan, format, maxChars, flightSignal, deps.artifacts),
-					{ signal: controller.signal, timeoutMs },
+					{ signal: controller.signal, timeoutMs, host: hostFromUrl(fetchPlan.fetchUrl) },
 				)
 				return {
 					content: [{ type: "text", text: content }],

@@ -22,7 +22,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 const DISABLED = process.env.PI_LSGF_DISABLE === "1"; // LGF-1: opt-out
 
 export default function lsGrepFindExtension(pi: ExtensionAPI) {
-	let warnedOverrides = false; // LGF-2: one warning per process, not per session
+	let warnedOverrides = false; // LGF-2: one warning per extension instance, not per session
 
 	pi.on("session_start", async () => {
 		if (DISABLED) return; // LGF-1: environment opt-out

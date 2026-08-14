@@ -265,8 +265,27 @@ function maybeTruncate(content: string, maxOutputChars: number): { text: string;
 		}
 		const lineChars = Array.from(line).length
 		const lineBytes = Buffer.byteLength(line, "utf8")
-		if (kept.length > 0 && (chars + lineChars > maxOutputChars || bytes + lineBytes > VIEW_MAX_OUTPUT_BYTES)) {
+		const charBudget = maxOutputChars - chars
+		const byteBudget = VIEW_MAX_OUTPUT_BYTES - bytes
+		if (lineChars > charBudget || lineBytes > byteBudget) {
 			clipped = true
+			if (charBudget > 0 && byteBudget > 0) {
+				// Clamp the over-budget line to a prefix on a code-point boundary —
+				// a single giant line (e.g. minified JS) must never produce an
+				// empty "view" nor blow past the caps. The marker tells the model
+				// the last line is partial.
+				let partial = ""
+				let usedChars = 0
+				let usedBytes = 0
+				for (const ch of line) {
+					const chBytes = Buffer.byteLength(ch, "utf8")
+					if (usedChars + 1 > charBudget || usedBytes + chBytes > byteBudget) break
+					partial += ch
+					usedChars += 1
+					usedBytes += chBytes
+				}
+				kept.push(partial)
+			}
 			break
 		}
 		kept.push(line)
@@ -654,8 +673,14 @@ async function runMutation(
   const after = args.command === "str_replace"
     ? computeReplaceAfter(before, args, path)
     : computeInsertAfter(before, args)
-  throwIfAborted(signal) // SRE-5: pre-write cancellation check.
-  await writeFile(path, encodeText(after, encoding))
+  if (after !== before) {
+    // SRE-5: pre-write cancellation check.
+    throwIfAborted(signal)
+    await writeFile(path, encodeText(after, encoding))
+  }
+  // No-op edits (old_str === new_str) skip the write entirely — the disk
+  // already matches the desired content, and rewriting would bump mtime
+  // plus silently normalize stray EOLs.
   // SRE-5: committed write wins over a late abort.
   const abortedAfterCommit = signal?.aborted === true
   const { diff, firstChangedLine } = generateDiffString(before, after)

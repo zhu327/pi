@@ -13,14 +13,14 @@
  *     "last"), instead of silently keeping a stale rate.
  *   - TR-3: stopReason `error`/`aborted`/`pending` is never reported as a
  *     rate; output === 0 shows "no output".
- *   - TR-4: the metric is labeled "effective tok/s" (end-to-end, includes
- *     reasoning tokens); a TTFT (time-to-first-token) is shown when the
- *     first message_update was observed.
+ *   - TR-4: the rate is end-to-end (includes reasoning tokens) — the
+ *     decode-only rate is appended in parens when reasoning tokens are
+ *     reported; a TTFT (time-to-first-token) is shown when the first
+ *     message_update was observed.
  *   - TR-5: state is reset on session_start; UI updates are guarded by
  *     hasUI + mode === "tui" (statistics still update in headless modes).
  *   - TR-6: the single-active-request assumption is explicit — overlapping
- *     requests increment a generation counter and supersede each other
- *     instead of silently mixing timestamps.
+ *     requests supersede each other instead of silently mixing timestamps.
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -29,7 +29,6 @@ const STATUS_KEY = "token-rate";
 
 /** One provider request under observation (TR-6: explicit single-flight model). */
 interface RequestRecord {
-	generation: number;
 	requestedAt: number;
 	firstTokenAt?: number;
 	finished: boolean;
@@ -39,7 +38,6 @@ interface RequestRecord {
 export default function (pi: ExtensionAPI) {
 	let current: RequestRecord | undefined;
 	let lastRateText: string | undefined;
-	let generation = 0;
 
 	const uiActive = (ctx: { hasUI: boolean; mode: string }): boolean =>
 		ctx.hasUI && ctx.mode === "tui"; // TR-5
@@ -57,14 +55,12 @@ export default function (pi: ExtensionAPI) {
 		// TR-5: fresh state per session; no stale rate survives /reload.
 		current = undefined;
 		lastRateText = undefined;
-		generation = 0;
 		if (uiActive(ctx)) {
 			ctx.ui.setStatus(STATUS_KEY, ctx.ui.theme.fg("dim", "⚡ idle"));
 		}
 	});
 
 	pi.on("before_provider_request", (_event, ctx) => {
-		generation += 1;
 		// TR-6: an overlap supersedes the previous request (its timestamp
 		// must not be mixed into the new one). The superseded request is
 		// reported as failed when agent_end eventually fires.
@@ -73,7 +69,6 @@ export default function (pi: ExtensionAPI) {
 			current.outcome = "failed";
 		}
 		current = {
-			generation,
 			requestedAt: performance.now(),
 			finished: false,
 		};
@@ -128,9 +123,10 @@ export default function (pi: ExtensionAPI) {
 			const nonReasoning = Math.max(outputTokens - reasoningTokens, 0);
 			text += ` (${rateText(nonReasoning, elapsedSeconds)} excl. reasoning)`;
 		}
-		text += " effective"; // TR-4: end-to-end, not decode-only
+		// TR-4: the rate is end-to-end by construction; TTFT (when observed)
+		// is appended last so the numeric rate always leads the status text.
 		if (ttft !== undefined) {
-			text = `TTFT ${(ttft / 1_000).toFixed(1)}s · ${text}`;
+			text += ` · TTFT ${(ttft / 1_000).toFixed(1)}s`;
 		}
 		lastRateText = text;
 		setStatus(ctx, ctx.ui.theme.fg("accent", text));

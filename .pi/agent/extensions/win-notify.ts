@@ -170,7 +170,8 @@ export default function (pi: ExtensionAPI) {
 	// ── Session state (WN-5: lives here, reset on session_start) ────────────
 	let sessionDisabled = DISABLED;
 	let platform: "win32" | "wsl" | "unsupported" = "unsupported";
-	let platformProbeDone = false;
+	// Success is cached for the process lifetime; a failure is retried on
+	// the next session (the environment may change, e.g. interop enabled).
 	let platformProbe: Promise<boolean> | undefined;
 	let shuttingDown = false;
 	let currentMode = "tui";
@@ -355,10 +356,10 @@ export default function (pi: ExtensionAPI) {
 			debugLog(`[unsupported] platform=${process.platform}; extension disabled for this session`);
 			return;
 		}
-		if (platform === "wsl" && !platformProbeDone) {
-			platformProbeDone = true;
+		if (platform === "wsl") {
 			const ok = await probePowershell();
 			if (!ok) {
+				platformProbe = undefined; // WN-1: retry on the next session
 				sessionDisabled = true;
 				warnOnce("unsupported", "win-notify: 检测不到 powershell.exe，本 session 已禁用通知");
 				return;

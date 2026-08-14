@@ -22,7 +22,7 @@
  * T-7 (update normalizes subject), T-8 (deleted tombstone immutable),
  * T-9 (domain errors throw → isError=true) plus extras: activeForm
  * required on in_progress, Integer id schema with minimum, blockedBy
- * dedupe, dependsOn status display, renderCall free of mutable state,
+ * dedupe, blockedBy status display, renderCall free of mutable state,
  * typed ExtensionUIContext/TUI/Component overlay.
  */
 
@@ -450,15 +450,16 @@ function formatGetLines(task: Task, state: TaskState): string {
 	if (task.description) lines.push(`  description: ${task.description}`);
 	if (task.activeForm) lines.push(`  activeForm: ${task.activeForm}`);
 	if (task.blockedBy?.length) {
-		// 附加: show each dependency's state so "dependsOn" is distinguishable
-		// from "currently blocked".
+		// 附加: show each dependency's state so a pending blocker is
+		// distinguishable from a completed one. The label stays `blockedBy` to
+		// match the parameter name the model uses.
 		const deps = task.blockedBy
 			.map((id) => {
 				const dep = state.tasks.find((t) => t.id === id);
 				return dep ? `#${id} (${dep.status})` : `#${id} (missing)`;
 			})
 			.join(", ");
-		lines.push(`  dependsOn: ${deps}`);
+		lines.push(`  blockedBy: ${deps}`);
 	}
 	if (blocks.length) lines.push(`  blocks: ${blocks.map((id) => `#${id}`).join(", ")}`);
 	return lines.join("\n");
