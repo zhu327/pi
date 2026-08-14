@@ -5,8 +5,9 @@
  * footer status bar.
  *
  * REFACTOR_PLAN.md tasks implemented:
- *   - TR-1: every `before_provider_request` shows "generating…" (the old
- *     rate is never mistaken for the in-flight request).
+ *   - TR-1: "generating…" is shown only until the first rate has been
+ *     displayed; afterwards the last rate stays fixed and is simply
+ *     overwritten when the next request completes.
  *   - TR-2: per-request records; a request that never completes shows
  *     "request failed" (optionally with the previous rate marked as
  *     "last"), instead of silently keeping a stale rate.
@@ -76,8 +77,12 @@ export default function (pi: ExtensionAPI) {
 			requestedAt: performance.now(),
 			finished: false,
 		};
-		// TR-1: always show generating for the in-flight request.
-		setStatus(ctx, ctx.ui.theme.fg("accent", "⚡ generating…"));
+		// TR-1: once a rate has been displayed, keep it fixed; only a
+		// completed request may overwrite it. "generating…" is shown only
+		// for the very first request (or after a "no output" request).
+		if (lastRateText === undefined) {
+			setStatus(ctx, ctx.ui.theme.fg("accent", "⚡ generating…"));
+		}
 	});
 
 	pi.on("message_update", (event) => {
