@@ -1,26 +1,20 @@
 # pi
 
-My [pi coding agent](https://github.com/badlogic/pi-mono) configuration — custom extensions, prompts, skills, and a WeChat bridge.
+My [pi coding agent](https://github.com/badlogic/pi-mono) configuration — custom extensions, external pi packages, and a WeChat bridge.
 
 ## Structure
 
 ```
 .pi/agent/
-├── AGENTS.md              # Karpathy 风格的 agent 行为准则
-├── extensions/            # 自定义扩展
-│   ├── ls-grep-find.ts     # 确保 ls、grep、find 工具始终激活
-│   ├── question.ts        # 结构化多问题 UI（chips、多选、预览）
-│   ├── str-replace-editor.ts # 精确文件编辑（view/create/str_replace/insert）
-│   ├── token-rate.ts       # 实时显示 token 输出速率（tok/s）
-│   ├── todo.ts            # 4 状态任务管理 + overlay widget（/todos 命令）
-│   ├── web-fetch.ts       # URL 抓取转 markdown，含 SSRF 防护
-│   └── win-notify.ts      # Windows 气泡通知（切出终端时提醒，WSL/原生 Windows 通用）
-├── prompts/
-│   └── handoff.md         # 会话交接 prompt（替代上下文压缩）
-└── skills/
-    └── skill-creator/     # Skill 创建、评估、迭代优化工具链
+└── extensions/           # 自定义扩展
+    ├── ls-grep-find.ts    # session 启动时激活 ls、grep、find 工具
+    ├── question.ts       # 结构化多问题 UI（chips、多选、预览）
+    ├── token-rate.ts      # 实时显示 token 输出速率（tok/s）
+    ├── todo.ts           # 4 状态任务管理 + overlay widget（/todos 命令）
+    ├── web-fetch.ts      # URL 抓取转 markdown，含 SSRF 防护
+    └── win-notify.ts     # Windows 气泡通知（切出终端时提醒，WSL/原生 Windows 通用）
 
-weixin-bridge-rpc.mjs      # 微信桥接独立进程（RPC 模式，spawn pi --mode rpc）
+weixin-bridge-rpc.mjs     # 微信桥接独立进程（RPC 模式，spawn pi --mode rpc）
 ```
 
 ## Setup
@@ -33,17 +27,19 @@ pi install npm:@gotgenes/pi-subagents
 
 - **@gotgenes/pi-subagents** — Claude Code 风格的子代理：在隔离 session 中并行执行任务，支持前台/后台运行、中途 steer、自定义 agent 类型。
 
+#### Optional: DeepSeek V4 harness
+
+```bash
+pi install npm:pi-dsh-minimal
+```
+
+- **pi-dsh-minimal** — 使用 `deepseek-v4-pro-0813` / `deepseek-v4-flash-0731` 时推荐安装。首轮请求使用官方两工具 surface，引导模型进入 **We need… / I need…** 思考模式，后续请求恢复 pi 原生工具。
+
 ### 2. web-search tool
 
 项目中还有一个 `web-search.ts` 工具，因使用了公司内部 API，不包含在本仓库中。
 
 可以基于 Tavily 或者 Brave 实现一个自己的 `web-search` Tool。
-
-## Design choices
-
-**交接优于上下文压缩。** 使用 `prompts/handoff.md` 生成结构化的交接文档，让新 agent session 可以无缝接续工作，而不是在单个超长会话中压缩上下文。交接文档保存到系统临时目录，不污染 workspace。
-
-**Karpathy 行为准则。** `AGENTS.md` 约束 agent 行为：先想再写、最简实现、手术式改动、目标驱动执行。减少过度工程和不必要的 diff。
 
 ## Extensions
 
@@ -53,8 +49,7 @@ pi install npm:@gotgenes/pi-subagents
 | `todo.ts` | `/todos` 命令，pending → in_progress → completed 的任务管理，带 TUI overlay |
 | `question.ts` | 结构化提问工具，支持单选/多选/自由输入，带预览面板 |
 | `web-fetch.ts` | 抓取 URL 内容并转为 markdown/text/html，内置大小限制和安全防护 |
-| `ls-grep-find.ts` | session 启动时自动激活 ls、grep、find 工具 |
-| `str-replace-editor.ts` | 精确文件编辑工具（view / create / str_replace / insert），自动处理 CRLF/BOM、严格 UTF-8 校验 |
+| `ls-grep-find.ts` | session 启动时自动激活 ls、grep、find 工具（一次性激活，不与其他扩展争夺） |
 | `win-notify.ts` | 检测前台窗口，切出终端时弹 Windows 气泡通知（WSL/原生 Windows 通用） |
 
 ## Windows Notify
