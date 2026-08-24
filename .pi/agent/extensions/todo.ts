@@ -34,6 +34,18 @@
  *   update constraints (single in_progress, transitions)
  * - entering in_progress without activeForm now succeeds with a tip in
  *   the tool result instead of failing the call
+ *
+ * Review fixes (2026-08-24):
+ * - renderCall truncates a recovered non-action `action` string (subject
+ *   text) so the TUI row stays one line
+ * - todos[] items fall back to content when subject is blank (matches
+ *   single-call recovery); >200-char subjects always park full text in
+ *   description, not just content-sourced ones
+ * - two id-less todos[] items with the same subject create two distinct
+ *   tasks (TodoWrite semantics) instead of failing the whole batch
+ * - session_start guards stale-ctx errors like compact/tree already do
+ * - subject/activeForm collapse internal whitespace (single-line labels;
+ *   prevents newline injection into line-based list output and the overlay)
  */
 
 import type { ExtensionAPI, ExtensionContext, ExtensionUIContext, Theme } from "@earendil-works/pi-coding-agent";
@@ -247,11 +259,13 @@ function errorResult(state: TaskState, message: string): ApplyResult {
 }
 
 function normalizeSubject(value: unknown): string {
-	return typeof value === "string" ? value.trim() : "";
+	// Collapse internal whitespace: subjects are single-line labels, and raw
+	// newlines would corrupt line-based list output and the TUI overlay.
+	return typeof value === "string" ? value.replace(/\s+/g, " ").trim() : "";
 }
 
 function normalizeActiveForm(value: unknown): string {
-	return typeof value === "string" ? value.trim() : "";
+	return typeof value === "string" ? value.replace(/\s+/g, " ").trim() : "";
 }
 
 /** Validate and dedupe a list of task ids; null when any entry is invalid. */
@@ -610,12 +624,16 @@ function applyTodoMerge(state: TaskState, value: unknown): ApplyResult {
 			return errorResult(state, `todos[${index}] must be an object`);
 		}
 		const item = raw as Record<string, unknown>;
-		const subjectValue = item.subject ?? item.content;
+		// Prefer subject, but fall back to content when subject is blank — mirrors
+		// the top-level subject/content recovery in normalizeCall().
+		const subjectValue =
+			typeof item.subject === "string" && normalizeSubject(item.subject) !== "" ? item.subject : (item.content ?? item.subject);
 		let subject = normalizeSubject(subjectValue);
 		// subject wins when both are present and differ; a disagreeing content
 		// that looks like a long description is downgraded to description.
 		let descriptionOverride: string | undefined;
 		if (
+			subject !== "" &&
 			typeof item.subject === "string" &&
 			typeof item.content === "string" &&
 			normalizeSubject(item.subject) !== normalizeSubject(item.content)
@@ -625,12 +643,12 @@ function applyTodoMerge(state: TaskState, value: unknown): ApplyResult {
 				descriptionOverride = contentTrimmed;
 			}
 		}
-		// content may be up to 10k chars, but subjects are capped at 200: keep a
-		// short subject and park the full text in description.
+		// subject/content may be up to 10k chars, but subjects are capped at 200:
+		// keep a short subject and park the full text in description.
 		if (subject.length > 200) {
 			const full = subject;
 			subject = subject.slice(0, 200);
-			if (item.description === undefined && descriptionOverride === undefined && subjectValue === item.content) {
+			if (item.description === undefined && descriptionOverride === undefined) {
 				descriptionOverride = full;
 			}
 		}
@@ -652,7 +670,13 @@ function applyTodoMerge(state: TaskState, value: unknown): ApplyResult {
 			if (!existing) return errorResult(state, `todos[${index}]: #${item.id} not found`);
 		} else {
 			if (!subject) return errorResult(state, `todos[${index}] requires subject/content when id is omitted`);
-			const matches = working.tasks.filter((task) => task.status !== "deleted" && task.subject === subject);
+			// Id-less items upsert by subject, but only against tasks that existed
+			// before this batch: two id-less items with the same subject in one
+			// call are distinct entries (TodoWrite semantics), not a double-target
+			// error.
+			const matches = working.tasks.filter(
+				(task) => task.status !== "deleted" && task.subject === subject && !created.includes(task.id),
+			);
 			if (matches.length > 1) {
 				return errorResult(state, `todos[${index}] subject ${JSON.stringify(subject)} is ambiguous; pass id`);
 			}
@@ -1526,11 +1550,13 @@ export default function (pi: ExtensionAPI) {
 			if (t.description !== undefined && typeof t.description !== "string") return undefined;
 			if (t.activeForm !== undefined && typeof t.activeForm !== "string") return undefined;
 			if (t.blockedBy !== undefined && !Array.isArray(t.blockedBy)) return undefined;
+			const subject = t.subject.replace(/\s+/g, " ").trim();
 			tasks.push({
 				id: t.id,
 				// Migration: older snapshots could contain >200-char subjects via
 				// the content alias; truncate instead of discarding the snapshot.
-				subject: t.subject.length > 200 ? t.subject.slice(0, 200) : t.subject,
+				// Whitespace is collapsed to keep subjects single-line.
+				subject: subject.length > 200 ? subject.slice(0, 200) : subject,
 				status: t.status as TaskStatus,
 				...(typeof t.description === "string" ? { description: t.description } : {}),
 				...(typeof t.activeForm === "string" ? { activeForm: t.activeForm } : {}),
@@ -1556,7 +1582,11 @@ export default function (pi: ExtensionAPI) {
 
 	// Session lifecycle
 	pi.on("session_start", async (_event, ctx) => {
-		reconstructState(ctx);
+		try {
+			reconstructState(ctx);
+		} catch (e) {
+			if (!isStaleCtxError(e)) throw e;
+		}
 		overlay.resetCompletedDisplayState();
 		if (ctx.hasUI) {
 			overlay.setUICtx(ctx.ui);
@@ -1683,8 +1713,12 @@ export default function (pi: ExtensionAPI) {
 						: args.id !== undefined
 							? "update"
 							: "list";
-			const glyph = inferredAction ? (ACTION_GLYPH[inferredAction] ?? inferredAction) : "?";
-			let text = theme.fg("toolTitle", theme.bold("todo ")) + theme.fg("muted", glyph);
+			const glyph = inferredAction !== undefined ? ACTION_GLYPH[inferredAction] ?? inferredAction : "?";
+			// A recovered `action` may hold the task subject (a documented
+			// failure mode handled by normalizeCall); keep the glyph short so the
+			// TUI row stays a single line.
+			const shortGlyph = glyph.length > 12 ? `${glyph.slice(0, 11)}…` : glyph;
+			let text = theme.fg("toolTitle", theme.bold("todo ")) + theme.fg("muted", shortGlyph);
 
 			// No mutable-state reads here: args are the only source.
 			if (args.todos) {
