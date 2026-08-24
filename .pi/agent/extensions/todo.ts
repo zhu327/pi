@@ -20,10 +20,20 @@
  * checks reverse deps), T-5 (overlay prioritizes active tasks), T-6
  * (widget lifecycle: invalidate only clears cache, reconcile unmounts),
  * T-7 (update normalizes subject), T-8 (deleted tombstone immutable),
- * T-9 (domain errors throw → isError=true) plus extras: activeForm
- * required on in_progress, Integer id schema with minimum, blockedBy
- * dedupe, blockedBy status display, renderCall free of mutable state,
- * typed ExtensionUIContext/TUI/Component overlay.
+ * T-9 (domain errors throw → isError=true) plus extras: Integer id
+ * schema with minimum, blockedBy dedupe, blockedBy status display,
+ * renderCall free of mutable state, typed ExtensionUIContext/TUI/
+ * Component overlay.
+ *
+ * Session-driven hardening (2026-08-24, from ~4800 logged calls):
+ * - subject/content disagreement no longer fails; subject wins and a
+ *   longer content is downgraded to description (content maxLength raised)
+ * - action containing a status value ({"action":"completed","id":1}) is
+ *   recovered as a status update instead of failing or polluting subject
+ * - create accepts an initial status and applies it through the same
+ *   update constraints (single in_progress, transitions)
+ * - entering in_progress without activeForm now succeeds with a tip in
+ *   the tool result instead of failing the call
  */
 
 import type { ExtensionAPI, ExtensionContext, ExtensionUIContext, Theme } from "@earendil-works/pi-coding-agent";
@@ -50,6 +60,9 @@ interface NormalizationDetails {
 	originalAction?: unknown;
 	actionAlias?: TaskAction;
 	recoveredSubjectFrom?: "action" | "content";
+	recoveredStatusFromAction?: { from: string; to: TaskStatus };
+	recoveredContentAsDescription?: boolean;
+	recoveredLongContentAsDescription?: boolean;
 	normalizedStatus?: { from: string; to: TaskStatus };
 	removedFields?: string[];
 }
@@ -58,8 +71,11 @@ interface TaskDetails {
 	action: TaskAction;
 	params: Record<string, unknown>;
 	normalization?: NormalizationDetails;
-	tasks: Task[];
-	nextId: number;
+	/** Snapshot version; present on mutation results that carry the full state. */
+	version?: number;
+	/** Full task snapshot — stored on mutations only, so read-only calls don't bloat the session. */
+	tasks?: Task[];
+	nextId?: number;
 }
 
 type TaskAction = "write" | "create" | "update" | "list" | "get" | "delete" | "clear";
@@ -111,6 +127,8 @@ const VALID_TRANSITIONS: Record<TaskStatus, ReadonlySet<TaskStatus>> = {
 	deleted: new Set(),
 };
 
+const VALID_STATUSES: ReadonlySet<string> = new Set(["pending", "in_progress", "completed", "deleted"]);
+
 function isTransitionValid(from: TaskStatus, to: TaskStatus): boolean {
 	if (from === to) return true;
 	return VALID_TRANSITIONS[from].has(to);
@@ -120,16 +138,7 @@ function isTransitionValid(from: TaskStatus, to: TaskStatus): boolean {
 // Dependency graph helpers
 // ---------------------------------------------------------------------------
 
-function detectCycle(tasks: readonly Task[], taskId: number, newBlockedBy: readonly number[]): boolean {
-	const edges = new Map<number, number[]>();
-	for (const t of tasks) {
-		if (t.id === taskId) {
-			const merged = new Set([...(t.blockedBy ?? []), ...newBlockedBy]);
-			edges.set(t.id, [...merged]);
-		} else {
-			edges.set(t.id, t.blockedBy ? [...t.blockedBy] : []);
-		}
-	}
+function hasCycleInEdges(edges: ReadonlyMap<number, readonly number[]>): boolean {
 	const visiting = new Set<number>();
 	const visited = new Set<number>();
 	const hasCycle = (node: number): boolean => {
@@ -147,6 +156,27 @@ function detectCycle(tasks: readonly Task[], taskId: number, newBlockedBy: reado
 		if (hasCycle(node)) return true;
 	}
 	return false;
+}
+
+function hasCycleInTasks(tasks: readonly Task[]): boolean {
+	const edges = new Map<number, number[]>();
+	for (const t of tasks) {
+		if (t.status === "deleted") continue; // frozen tombstones cannot participate
+		edges.set(t.id, t.blockedBy ? [...t.blockedBy] : []);
+	}
+	return hasCycleInEdges(edges);
+}
+
+function detectCycle(tasks: readonly Task[], taskId: number, newBlockedBy: readonly number[]): boolean {
+	const edges = new Map<number, number[]>();
+	for (const t of tasks) {
+		if (t.id === taskId) {
+			edges.set(t.id, [...new Set([...(t.blockedBy ?? []), ...newBlockedBy])]);
+		} else {
+			edges.set(t.id, t.blockedBy ? [...t.blockedBy] : []);
+		}
+	}
+	return hasCycleInEdges(edges);
 }
 
 /** task id → ids of non-deleted tasks that depend on it. */
@@ -259,6 +289,54 @@ function findOtherInProgress(tasks: readonly Task[], selfId: number): Task | und
 	return tasks.find((t) => t.status === "in_progress" && t.id !== selfId);
 }
 
+/**
+ * Final-state invariant check, shared by every mutation and snapshot restore.
+ * Rules enforced here must hold for direct calls AND batch writes alike.
+ */
+function validateState(state: TaskState): string | undefined {
+	const ids = new Set<number>();
+	let maxId = 0;
+	let inProgressCount = 0;
+	for (const t of state.tasks) {
+		if (!Number.isInteger(t.id) || t.id < 1) return "invalid task id";
+		if (ids.has(t.id)) return `duplicate task id #${t.id}`;
+		ids.add(t.id);
+		if (t.id > maxId) maxId = t.id;
+		if (typeof t.subject !== "string" || t.subject.trim() === "") return `task #${t.id} has an invalid subject`;
+		if (t.subject.length > 200) return `task #${t.id} subject exceeds 200 characters`;
+		if (typeof t.status !== "string" || !VALID_STATUSES.has(t.status)) return `task #${t.id} has an invalid status`;
+		if (t.description !== undefined && typeof t.description !== "string") return `task #${t.id} has an invalid description`;
+		if (t.activeForm !== undefined && typeof t.activeForm !== "string") return `task #${t.id} has an invalid activeForm`;
+		if (t.status === "in_progress") inProgressCount += 1;
+		// Frozen tombstones keep their old dependency edges; they cannot mutate,
+		// so they neither violate nor participate in the dependency invariants.
+		if (t.status === "deleted") continue;
+		if (t.blockedBy !== undefined) {
+			if (!Array.isArray(t.blockedBy)) return `task #${t.id} blockedBy must be an array`;
+			const seen = new Set<number>();
+			for (const dep of t.blockedBy) {
+				if (!Number.isInteger(dep) || dep < 1) return `task #${t.id} has an invalid blockedBy id`;
+				if (seen.has(dep)) return `task #${t.id} has duplicate blockedBy ids`;
+				seen.add(dep);
+				if (dep === t.id) return `task #${t.id} cannot block on itself`;
+				const depTask = state.tasks.find((x) => x.id === dep);
+				if (!depTask) return `task #${t.id} blockedBy #${dep} not found`;
+				if (depTask.status === "deleted") return `task #${t.id} blockedBy #${dep} is deleted`;
+			}
+		}
+		if ((t.status === "in_progress" || t.status === "completed") && (t.blockedBy?.length ?? 0) > 0) {
+			const blockerError = checkBlockersForTransition(state.tasks, t.blockedBy ?? []);
+			if (blockerError) return `task #${t.id}: ${blockerError}`;
+		}
+	}
+	if (inProgressCount > 1) return "more than one task is in_progress";
+	if (!Number.isInteger(state.nextId) || state.nextId <= maxId) {
+		return `nextId ${String(state.nextId)} must be greater than the max task id ${maxId}`;
+	}
+	if (hasCycleInTasks(state.tasks)) return "blockedBy contains a cycle";
+	return undefined;
+}
+
 // ---------------------------------------------------------------------------
 // Call normalization — accept common TodoWrite/Codex shapes defensively
 // ---------------------------------------------------------------------------
@@ -329,16 +407,37 @@ function normalizeCall(params: Record<string, unknown>): NormalizedCall | Invali
 	const diagnostics: NormalizationDetails = {};
 
 	// Claude Code/OpenCode use `content`; this tool calls the same field `subject`.
-	if (typeof next.content === "string" && next.content.trim() !== "" && next.subject === undefined) {
-		next.subject = next.content.trim();
+	if (
+		typeof next.content === "string" &&
+		next.content.trim() !== "" &&
+		(next.subject === undefined || normalizeSubject(next.subject) === "")
+	) {
+		const contentSubject = next.content.trim();
+		// content may be up to 10k chars, but subjects are capped at 200: keep a
+		// short subject and park the full text in description instead of
+		// silently inflating the subject.
+		if (contentSubject.length > 200) {
+			next.subject = contentSubject.slice(0, 200);
+			if (next.description === undefined) next.description = contentSubject;
+			diagnostics.recoveredLongContentAsDescription = true;
+		} else {
+			next.subject = contentSubject;
+		}
 		diagnostics.recoveredSubjectFrom = "content";
 	}
+	// Models sometimes send both a short `subject` and a long `content` (Claude
+	// Code shapes where content is a detailed description). subject wins; a
+	// disagreeing content is downgraded to description when it looks like one.
 	if (
 		typeof next.subject === "string" &&
 		typeof next.content === "string" &&
 		normalizeSubject(next.subject) !== normalizeSubject(next.content)
 	) {
-		return { ok: false, error: "subject and content disagree", diagnostics: withDiagnostics(diagnostics) };
+		const contentTrimmed = next.content.trim();
+		if (next.description === undefined && contentTrimmed.length > normalizeSubject(next.subject).length) {
+			next.description = contentTrimmed;
+			diagnostics.recoveredContentAsDescription = true;
+		}
 	}
 	if (next.content !== undefined) {
 		delete next.content;
@@ -358,6 +457,38 @@ function normalizeCall(params: Record<string, unknown>): NormalizedCall | Invali
 			explicitAction = ACTION_ALIASES[token];
 			diagnostics.originalAction = next.action;
 			diagnostics.actionAlias = explicitAction;
+		} else if (STATUS_ALIASES[token]) {
+			// Historical failure mode: the model writes the target status into
+			// `action` (e.g. {"action":"completed","id":1}). Treat it as a
+			// status update instead of failing or polluting the subject.
+			const statusFromAction = STATUS_ALIASES[token];
+			diagnostics.originalAction = next.action;
+			diagnostics.recoveredStatusFromAction = { from: next.action, to: statusFromAction };
+			if (next.id === undefined) {
+				return {
+					ok: false,
+					error: `action ${JSON.stringify(next.action)} looks like a status; a status update needs id`,
+					diagnostics: withDiagnostics(diagnostics),
+				};
+			}
+			if (next.status !== undefined) {
+				const existingStatus = normalizeStatus(next.status);
+				if (existingStatus === undefined) {
+					return {
+						ok: false,
+						error: `unknown todo status: ${JSON.stringify(next.status)}`,
+						diagnostics: withDiagnostics(diagnostics),
+					};
+				}
+				if (existingStatus !== statusFromAction) {
+					return {
+						ok: false,
+						error: `action ${JSON.stringify(next.action)} conflicts with status ${JSON.stringify(next.status)}`,
+						diagnostics: withDiagnostics(diagnostics),
+					};
+				}
+			}
+			next.status = statusFromAction;
 		} else {
 			diagnostics.originalAction = next.action;
 			// Historical failure mode: action contains the task title. Only salvage
@@ -464,7 +595,14 @@ function applyTodoMerge(state: TaskState, value: unknown): ApplyResult {
 	const updated: number[] = [];
 	let unchanged = 0;
 	const statusUpdates: Array<{ index: number; id: number; status: TaskStatus }> = [];
-	const deferredBlockedBy: Array<{ index: number; id: number; blockedBy: number[] }> = [];
+	// All blockedBy edits — for existing AND new tasks — are applied after every
+	// create has run, so a task may depend on one created later in this batch.
+	const deferredBlockedBy: Array<{ index: number; id: number; add: number[]; remove: number[] }> = [];
+	// Task id → item index for items that explicitly passed an empty activeForm.
+	const explicitEmptyActiveForm = new Map<number, number>();
+	const markUpdated = (id: number): void => {
+		if (!created.includes(id) && !updated.includes(id)) updated.push(id);
+	};
 
 	for (let index = 0; index < value.length; index++) {
 		const raw = value[index];
@@ -473,13 +611,28 @@ function applyTodoMerge(state: TaskState, value: unknown): ApplyResult {
 		}
 		const item = raw as Record<string, unknown>;
 		const subjectValue = item.subject ?? item.content;
-		const subject = normalizeSubject(subjectValue);
+		let subject = normalizeSubject(subjectValue);
+		// subject wins when both are present and differ; a disagreeing content
+		// that looks like a long description is downgraded to description.
+		let descriptionOverride: string | undefined;
 		if (
 			typeof item.subject === "string" &&
 			typeof item.content === "string" &&
 			normalizeSubject(item.subject) !== normalizeSubject(item.content)
 		) {
-			return errorResult(state, `todos[${index}] subject and content disagree`);
+			const contentTrimmed = item.content.trim();
+			if (item.description === undefined && contentTrimmed.length > subject.length) {
+				descriptionOverride = contentTrimmed;
+			}
+		}
+		// content may be up to 10k chars, but subjects are capped at 200: keep a
+		// short subject and park the full text in description.
+		if (subject.length > 200) {
+			const full = subject;
+			subject = subject.slice(0, 200);
+			if (item.description === undefined && descriptionOverride === undefined && subjectValue === item.content) {
+				descriptionOverride = full;
+			}
 		}
 
 		let desiredStatus: TaskStatus | undefined;
@@ -509,12 +662,17 @@ function applyTodoMerge(state: TaskState, value: unknown): ApplyResult {
 		if (existing) {
 			if (claimed.has(existing.id)) return errorResult(state, `todos[${index}] targets #${existing.id} more than once`);
 			claimed.add(existing.id);
+			const effectiveDescription =
+				item.description !== undefined ? item.description : descriptionOverride;
 			const update: Record<string, unknown> = { id: existing.id };
 			if (subject && subject !== existing.subject) update.subject = subject;
-			if (item.description !== undefined && item.description !== existing.description) update.description = item.description;
+			if (effectiveDescription !== undefined && effectiveDescription !== existing.description) {
+				update.description = effectiveDescription;
+			}
 			if (item.activeForm !== undefined && normalizeActiveForm(item.activeForm) !== (existing.activeForm ?? "")) {
 				update.activeForm = item.activeForm;
 			}
+			let blockedByDeferred = false;
 			if (item.blockedBy !== undefined) {
 				const desired = normalizeIds(item.blockedBy);
 				if (desired === null) return errorResult(state, `todos[${index}].blockedBy must contain positive integer ids`);
@@ -522,8 +680,10 @@ function applyTodoMerge(state: TaskState, value: unknown): ApplyResult {
 				const wanted = new Set(desired);
 				const add = desired.filter((id) => !current.has(id));
 				const remove = [...current].filter((id) => !wanted.has(id));
-				if (add.length) update.addBlockedBy = add;
-				if (remove.length) update.removeBlockedBy = remove;
+				if (add.length || remove.length) {
+					deferredBlockedBy.push({ index, id: existing.id, add, remove });
+					blockedByDeferred = true;
+				}
 			}
 			const hasFieldChanges = Object.keys(update).length > 1;
 			const hasStatusChange = desiredStatus !== undefined && desiredStatus !== existing.status;
@@ -531,9 +691,13 @@ function applyTodoMerge(state: TaskState, value: unknown): ApplyResult {
 				const result = applyMutation(working, "update", update);
 				if (result.op.kind === "error") return errorResult(state, `todos[${index}]: ${result.op.message}`);
 				working = result.state;
-				updated.push(existing.id);
-			} else if (!hasStatusChange) {
+				markUpdated(existing.id);
+			}
+			if (!hasFieldChanges && !hasStatusChange && !blockedByDeferred) {
 				unchanged += 1;
+			}
+			if (item.activeForm !== undefined && normalizeActiveForm(item.activeForm) === "") {
+				explicitEmptyActiveForm.set(existing.id, index);
 			}
 			if (desiredStatus !== undefined) statusUpdates.push({ index, id: existing.id, status: desiredStatus });
 			continue;
@@ -541,6 +705,7 @@ function applyTodoMerge(state: TaskState, value: unknown): ApplyResult {
 
 		const create: Record<string, unknown> = { subject };
 		if (item.description !== undefined) create.description = item.description;
+		else if (descriptionOverride !== undefined) create.description = descriptionOverride;
 		if (item.activeForm !== undefined) create.activeForm = item.activeForm;
 		let deferredBlocked: number[] | undefined;
 		if (item.blockedBy !== undefined) {
@@ -555,16 +720,23 @@ function applyTodoMerge(state: TaskState, value: unknown): ApplyResult {
 		const id = result.op.taskId;
 		claimed.add(id);
 		created.push(id);
-		if (deferredBlocked) deferredBlockedBy.push({ index, id, blockedBy: deferredBlocked });
+		if (deferredBlocked) deferredBlockedBy.push({ index, id, add: deferredBlocked, remove: [] });
+		if (item.activeForm !== undefined && normalizeActiveForm(item.activeForm) === "") {
+			explicitEmptyActiveForm.set(id, index);
+		}
 		if (desiredStatus !== undefined && desiredStatus !== "pending") statusUpdates.push({ index, id, status: desiredStatus });
 	}
 
-	// Apply blockedBy for newly created tasks after all creates have run, so
+	// Apply blockedBy for new AND existing tasks after all creates have run, so
 	// dependencies on tasks created later in the same batch resolve cleanly.
 	for (const deferred of deferredBlockedBy) {
-		const result = applyMutation(working, "update", { id: deferred.id, addBlockedBy: deferred.blockedBy });
+		const update: Record<string, unknown> = { id: deferred.id };
+		if (deferred.add.length) update.addBlockedBy = deferred.add;
+		if (deferred.remove.length) update.removeBlockedBy = deferred.remove;
+		const result = applyMutation(working, "update", update);
 		if (result.op.kind === "error") return errorResult(state, `todos[${deferred.index}]: ${result.op.message}`);
 		working = result.state;
+		markUpdated(deferred.id);
 	}
 
 	// Resolve transitions atomically. Retrying lets blockers complete first and
@@ -590,13 +762,25 @@ function applyTodoMerge(state: TaskState, value: unknown): ApplyResult {
 				nextRound.push(change);
 			} else {
 				working = result.state;
-				if (!created.includes(change.id) && !updated.includes(change.id)) updated.push(change.id);
+				markUpdated(change.id);
 				progressed = true;
 			}
 		}
 		if (!progressed) return errorResult(state, firstError);
 		remaining = nextRound;
 	}
+
+	// Batch must honor the same explicit-empty activeForm rule as single calls:
+	// the status phase above cannot see that the caller explicitly passed "".
+	for (const [id, index] of explicitEmptyActiveForm) {
+		const task = working.tasks.find((t) => t.id === id);
+		if (task?.status === "in_progress") {
+			return errorResult(state, `todos[${index}]: activeForm (non-empty) is required while a task is in_progress`);
+		}
+	}
+
+	const invariantError = validateState(working);
+	if (invariantError) return errorResult(state, `internal invariant violation: ${invariantError}`);
 
 	return { state: working, op: { kind: "write", created, updated, unchanged } };
 }
@@ -609,13 +793,13 @@ function applyMutation(state: TaskState, action: TaskAction, params: Record<stri
 		case "create": {
 			const subject = normalizeSubject(params.subject);
 			if (!subject) return errorResult(state, "subject required for create");
-			// Create always starts pending — reject a status instead of silently
-			// ignoring it (the model would believe the task has that status).
-			if (params.status !== undefined) {
-				return errorResult(state, "status is not valid for create; new tasks always start as pending");
+			if (subject.length > 200) {
+				return errorResult(state, "subject cannot exceed 200 characters; put long text in description");
 			}
-			// 附加: dedupe blockedBy ids on create (the schema's uniqueItems
-				// already rejects duplicates on the model path; direct callers get dedupe).
+			// Create starts as pending, then an optional status is applied through
+			// the same update constraints (single in_progress, activeForm, blockers).
+			// Dedupe blockedBy ids on create (the schema's uniqueItems already
+			// rejects duplicates on the model path; direct callers get dedupe).
 			const blockedBy = params.blockedBy !== undefined ? normalizeIds(params.blockedBy) : [];
 			if (blockedBy === null) {
 				return errorResult(state, "blockedBy must be an array of positive integer task ids");
@@ -625,12 +809,30 @@ function applyMutation(state: TaskState, action: TaskAction, params: Record<stri
 				if (!depTask) return errorResult(state, `blockedBy: #${dep} not found`);
 				if (depTask.status === "deleted") return errorResult(state, `blockedBy: #${dep} is deleted`);
 			}
+			// Same rule as update: an explicitly empty activeForm is rejected when
+			// the task ends up in_progress (omitting it stays allowed).
+			if (params.activeForm !== undefined && normalizeActiveForm(params.activeForm) === "" && params.status === "in_progress") {
+				return errorResult(state, "activeForm (non-empty) is required while a task is in_progress");
+			}
 			const newTask: Task = { id: state.nextId, subject, status: "pending" };
 			if (params.description) newTask.description = params.description as string;
 			if (params.activeForm) newTask.activeForm = normalizeActiveForm(params.activeForm);
 			if (blockedBy.length) newTask.blockedBy = blockedBy;
+			let createdState: TaskState = { tasks: [...state.tasks, newTask], nextId: state.nextId + 1 };
+			if (params.status !== undefined && params.status !== "pending") {
+				const statusResult = applyMutation(createdState, "update", { id: newTask.id, status: params.status });
+				if (statusResult.op.kind === "error") {
+					return errorResult(
+						state,
+						`created #${newTask.id} but could not set status ${String(params.status)}: ${statusResult.op.message}`,
+					);
+				}
+				createdState = statusResult.state;
+			}
+			const invariantError = validateState(createdState);
+			if (invariantError) return errorResult(state, `internal invariant violation: ${invariantError}`);
 			return {
-				state: { tasks: [...state.tasks, newTask], nextId: state.nextId + 1 },
+				state: createdState,
 				op: { kind: "create", taskId: newTask.id },
 			};
 		}
@@ -677,13 +879,14 @@ function applyMutation(state: TaskState, action: TaskAction, params: Record<stri
 				if (target === "in_progress" && current.status !== "in_progress") {
 					const other = findOtherInProgress(state.tasks, current.id);
 					if (other) {
-						return errorResult(state, `#${other.id} "${other.subject}" is already in_progress; only one task may be in_progress at a time`);
+						return errorResult(
+							state,
+							`#${other.id} "${other.subject}" is already in_progress; only one task may be in_progress at a time — finish it or set it back to pending first`,
+						);
 					}
-					// 附加: activeForm is required when entering in_progress.
-					const form = params.activeForm !== undefined ? normalizeActiveForm(params.activeForm) : current.activeForm ?? "";
-					if (!form) {
-						return errorResult(state, "activeForm (non-empty) is required when marking a task in_progress");
-					}
+					// 附加(放宽): activeForm is preferred when entering in_progress,
+					// but no longer required — the tool result adds a tip instead.
+					// (An explicitly passed empty activeForm is still rejected below.)
 				}
 				newStatus = target;
 			}
@@ -728,6 +931,9 @@ function applyMutation(state: TaskState, action: TaskAction, params: Record<stri
 				// T-7: subject updates are trimmed and must stay non-empty.
 				const trimmed = normalizeSubject(params.subject);
 				if (!trimmed) return errorResult(state, "subject cannot be empty after trimming");
+				if (trimmed.length > 200) {
+					return errorResult(state, "subject cannot exceed 200 characters; put long text in description");
+				}
 				updated.subject = trimmed;
 			}
 			if (params.description !== undefined) updated.description = params.description as string;
@@ -743,8 +949,11 @@ function applyMutation(state: TaskState, action: TaskAction, params: Record<stri
 
 			const newTasks = [...state.tasks];
 			newTasks[idx] = updated;
+			const newState: TaskState = { tasks: newTasks, nextId: state.nextId };
+			const invariantError = validateState(newState);
+			if (invariantError) return errorResult(state, `internal invariant violation: ${invariantError}`);
 			return {
-				state: { tasks: newTasks, nextId: state.nextId },
+				state: newState,
 				op: { kind: "update", id: updated.id, fromStatus: current.status, toStatus: newStatus },
 			};
 		}
@@ -784,8 +993,11 @@ function applyMutation(state: TaskState, action: TaskAction, params: Record<stri
 			const updated: Task = { ...current, status: "deleted" };
 			const newTasks = [...state.tasks];
 			newTasks[idx] = updated;
+			const newState: TaskState = { tasks: newTasks, nextId: state.nextId };
+			const invariantError = validateState(newState);
+			if (invariantError) return errorResult(state, `internal invariant violation: ${invariantError}`);
 			return {
-				state: { tasks: newTasks, nextId: state.nextId },
+				state: newState,
 				op: { kind: "delete", id: updated.id, subject: updated.subject },
 			};
 		}
@@ -844,7 +1056,7 @@ function formatContent(op: Op, state: TaskState): string {
 		case "create": {
 			const t = state.tasks.find((x) => x.id === op.taskId);
 			if (!t) return `Created #${op.taskId}`;
-			return `Created #${t.id}: ${t.subject} (pending)`;
+			return `Created #${t.id}: ${t.subject} (${STATUS_LABEL[t.status]})`;
 		}
 		case "update": {
 			const transition = op.fromStatus !== op.toStatus ? ` (${op.fromStatus} → ${op.toStatus})` : "";
@@ -858,7 +1070,26 @@ function formatContent(op: Op, state: TaskState): string {
 			let view = state.tasks;
 			if (!op.includeDeleted) view = view.filter((t) => t.status !== "deleted");
 			if (op.statusFilter) view = view.filter((t) => t.status === op.statusFilter);
-			return view.length === 0 ? "No tasks" : view.map(formatListLine).join("\n");
+			if (view.length === 0) return "No tasks";
+			// Cap the LLM-facing output well under Pi's ~50KB tool-result budget.
+			const lines: string[] = [];
+			let bytes = 0;
+			let hidden = 0;
+			for (const t of view) {
+				const line = formatListLine(t);
+				const lineBytes = Buffer.byteLength(line, "utf8") + 1;
+				if (lines.length > 0 && bytes + lineBytes > MAX_LIST_OUTPUT_BYTES) {
+					hidden += 1;
+					continue;
+				}
+				lines.push(line);
+				bytes += lineBytes;
+			}
+			let text = lines.join("\n");
+			if (hidden > 0) {
+				text += `\n[output truncated: ${hidden} of ${view.length} tasks hidden; narrow with action:"list" + status filter or action:"get" with id]`;
+			}
+			return text;
 		}
 		case "get":
 			return formatGetLines(op.task, state);
@@ -874,7 +1105,7 @@ function formatContent(op: Op, state: TaskState): string {
 const TodoItemParams = Type.Object({
 	id: Type.Optional(Type.Integer({ minimum: 1, description: "Existing task id; omit to match by subject/content or create" })),
 	subject: Type.Optional(Type.String({ maxLength: 200, description: "Task subject (native todo shape)" })),
-	content: Type.Optional(Type.String({ maxLength: 200, description: "Task subject (Claude Code/OpenCode compatible alias)" })),
+	content: Type.Optional(Type.String({ maxLength: 10_000, description: "Task subject (Claude Code/OpenCode compatible alias); text beyond 200 chars is kept in description" })),
 	description: Type.Optional(Type.String({ maxLength: 10_000 })),
 	activeForm: Type.Optional(Type.String({ maxLength: 120 })),
 	status: Type.Optional(
@@ -904,7 +1135,7 @@ const TodoParams = Type.Object({
 		}),
 	),
 	subject: Type.Optional(Type.String({ description: "Task subject line (required for create)", maxLength: 200 })),
-	content: Type.Optional(Type.String({ description: "Claude Code/OpenCode-compatible alias for subject", maxLength: 200 })),
+	content: Type.Optional(Type.String({ description: "Claude Code/OpenCode-compatible alias for subject; text beyond 200 chars is kept in description", maxLength: 10_000 })),
 	description: Type.Optional(Type.String({ description: "Long-form task description", maxLength: 10_000 })),
 	activeForm: Type.Optional(
 		Type.String({
@@ -949,6 +1180,8 @@ const TodoParams = Type.Object({
 
 const WIDGET_KEY = "todo-overlay";
 const MAX_WIDGET_LINES = 12;
+// Keep list tool output well under Pi's ~50KB tool-result budget.
+const MAX_LIST_OUTPUT_BYTES = 40 * 1024;
 
 interface WidgetRenderCache {
 	width: number;
@@ -963,7 +1196,9 @@ class TodoOverlay {
 	private currentState: TaskState = { tasks: [], nextId: 1 };
 	private theme: Theme | undefined;
 	// Two-phase auto-hide: completed tasks stay visible until the next agent
-	// turn starts, then disappear. When all tasks are hidden, the widget unmounts.
+	// turn starts, then disappear. update() marks every visible completed task —
+	// including ones the widget never had room to display — for hiding.
+	// When all tasks are hidden, the widget unmounts.
 	private completedTaskIdsPendingHide = new Set<number>();
 	private hiddenCompletedTaskIds = new Set<number>();
 	// T-6: invalidate() only clears this cache; lifecycle stays with update()/dispose().
@@ -987,7 +1222,7 @@ class TodoOverlay {
 		this.hiddenCompletedTaskIds.clear();
 	}
 
-	hideCompletedTasksFromPreviousTurn(): void {
+	hideCompletedTasksForNewTurn(): void {
 		if (this.completedTaskIdsPendingHide.size === 0) return;
 		for (const id of this.completedTaskIdsPendingHide) {
 			this.hiddenCompletedTaskIds.add(id);
@@ -1020,6 +1255,18 @@ class TodoOverlay {
 		if (!this.uiCtx) return;
 		this.currentState = nextState;
 		this.syncHiddenSets();
+		// Mark every visible completed task for hiding at the next agent turn.
+		// Driven by state changes here (not by render()) so completed tasks that
+		// were collapsed behind the "+N more" footer are not forgotten.
+		for (const t of nextState.tasks) {
+			if (
+				t.status === "completed" &&
+				!this.completedTaskIdsPendingHide.has(t.id) &&
+				!this.hiddenCompletedTaskIds.has(t.id)
+			) {
+				this.completedTaskIdsPendingHide.add(t.id);
+			}
+		}
 		this.generation += 1;
 		const visible = this.selectOverlayVisible();
 		if (visible.length === 0) {
@@ -1110,13 +1357,6 @@ class TodoOverlay {
 
 		if (hiddenExtra > 0) {
 			lines.push(truncate(`${theme.fg("dim", "└─")} ${theme.fg("dim", `+${hiddenExtra} more`)}`));
-		}
-
-		// Track displayed completed tasks → mark for hiding on next agent turn.
-		for (const t of bodyTasks) {
-			if (t.status === "completed" && !this.completedTaskIdsPendingHide.has(t.id) && !this.hiddenCompletedTaskIds.has(t.id)) {
-				this.completedTaskIdsPendingHide.add(t.id);
-			}
 		}
 
 		this.cache = { width, generation: this.generation, lines };
@@ -1268,19 +1508,48 @@ export default function (pi: ExtensionAPI) {
 	let state: TaskState = { tasks: [], nextId: 1 };
 	const overlay = new TodoOverlay();
 
+	/**
+	 * Parse and validate a persisted snapshot. Snapshots from unknown versions
+	 * or with corrupt shapes/invariants return undefined so reconstruction falls
+	 * back to the last valid snapshot instead of loading broken state.
+	 */
+	const parseSnapshot = (details: unknown): TaskState | undefined => {
+		if (!details || typeof details !== "object") return undefined;
+		const d = details as { version?: unknown; tasks?: unknown; nextId?: unknown };
+		if (d.version !== undefined && d.version !== 1) return undefined;
+		if (!Array.isArray(d.tasks) || typeof d.nextId !== "number") return undefined;
+		const tasks: Task[] = [];
+		for (const raw of d.tasks) {
+			if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+			const t = raw as Record<string, unknown>;
+			if (typeof t.id !== "number" || typeof t.subject !== "string" || typeof t.status !== "string") return undefined;
+			if (t.description !== undefined && typeof t.description !== "string") return undefined;
+			if (t.activeForm !== undefined && typeof t.activeForm !== "string") return undefined;
+			if (t.blockedBy !== undefined && !Array.isArray(t.blockedBy)) return undefined;
+			tasks.push({
+				id: t.id,
+				// Migration: older snapshots could contain >200-char subjects via
+				// the content alias; truncate instead of discarding the snapshot.
+				subject: t.subject.length > 200 ? t.subject.slice(0, 200) : t.subject,
+				status: t.status as TaskStatus,
+				...(typeof t.description === "string" ? { description: t.description } : {}),
+				...(typeof t.activeForm === "string" ? { activeForm: t.activeForm } : {}),
+				...(Array.isArray(t.blockedBy) ? { blockedBy: [...new Set(t.blockedBy as number[])] } : {}),
+			});
+		}
+		const candidate: TaskState = { tasks, nextId: d.nextId };
+		if (validateState(candidate)) return undefined;
+		return candidate;
+	};
+
 	const reconstructState = (ctx: ExtensionContext) => {
 		let result: TaskState = { tasks: [], nextId: 1 };
 		for (const entry of ctx.sessionManager.getBranch()) {
 			if (entry.type !== "message") continue;
 			const msg = entry.message;
 			if (msg.role !== "toolResult" || msg.toolName !== "todo") continue;
-			const details = msg.details as TaskDetails | undefined;
-			if (details && Array.isArray(details.tasks) && typeof details.nextId === "number") {
-				result = {
-					tasks: details.tasks.map((t) => ({ ...t, ...(t.blockedBy ? { blockedBy: [...t.blockedBy] } : {}) })),
-					nextId: details.nextId,
-				};
-			}
+			const snapshot = parseSnapshot(msg.details);
+			if (snapshot) result = snapshot;
 		}
 		state = result;
 	};
@@ -1328,9 +1597,10 @@ export default function (pi: ExtensionAPI) {
 		overlay.update(state);
 	});
 
-	// When the agent starts a new turn, hide completed tasks from the previous turn
-	pi.on("agent_start", async () => {
-		overlay.hideCompletedTasksFromPreviousTurn();
+	// turn_start fires for every LLM turn (not just once per user prompt), so
+	// completed tasks disappear at the next model turn as intended.
+	pi.on("turn_start", async () => {
+		overlay.hideCompletedTasksForNewTurn();
 	});
 
 	// Register the todo tool
@@ -1338,7 +1608,7 @@ export default function (pi: ExtensionAPI) {
 		name: "todo",
 		label: "Todo",
 		description:
-			"Manage a task list for multi-step work. For initial/multiple tasks, pass one todos array (batch merge/upsert; omitted existing tasks are preserved). For individual operations use action: create, update, list, get, delete, or clear. subject and the TodoWrite-style content alias are both accepted. Status: pending → in_progress → completed, plus deleted tombstone.",
+			"Manage a task list for multi-step work. For initial/multiple tasks, pass one todos array (batch merge/upsert; omitted existing tasks are preserved). For individual operations use action: create, update, list, get, delete, or clear. subject and the TodoWrite-style content alias are both accepted. Status: pending → in_progress → completed, plus deleted tombstone. list output is capped at ~40KB; use get with id or a status filter to narrow large lists.",
 		promptSnippet: "Manage a task list to track multi-step progress",
 		promptGuidelines: [
 			"Use `todo` for complex work with 3+ steps, when the user gives you a list of tasks, or immediately after receiving new instructions to capture requirements. Skip it for single trivial tasks and purely conversational requests.",
@@ -1347,8 +1617,8 @@ export default function (pi: ExtensionAPI) {
 			"Never mark a task completed if tests are failing, the implementation is partial, or you hit unresolved errors — keep it in_progress and create a new task for the blocker instead.",
 			"Task status is a 4-state machine: pending → in_progress → completed, plus deleted as a tombstone. Pass activeForm (present-continuous label, e.g. 'researching existing tool') when marking in_progress.",
 			"Use blockedBy to express dependencies (A is blocked by B). On create, pass blockedBy as the initial set. On update, use addBlockedBy / removeBlockedBy (additive merge — do not resend the full array). Cycles are rejected.",
-			"list hides tombstoned (deleted) tasks by default; pass includeDeleted:true to see them. Pass status to filter by a single status.",
-			"Subject must be short and imperative (e.g. 'Research existing tool'); description is for long-form detail. activeForm is a present-continuous label shown while in_progress.",
+			"list hides tombstoned (deleted) tasks by default; pass includeDeleted:true to see them. Pass status to filter by a single status. list output is capped (~40KB) — narrow large lists with get/status filter.",
+			"Subject must be short and imperative (max 200 chars; e.g. 'Research existing tool'); description is for long-form detail. activeForm is a present-continuous label shown while in_progress.",
 		],
 		parameters: TodoParams,
 		// T-1: shared mutable state + parallel execution would race.
@@ -1363,13 +1633,42 @@ export default function (pi: ExtensionAPI) {
 			// isError=true; state is only advanced on success.
 			if (result.op.kind === "error") throw new Error(result.op.message);
 			state = result.state;
-			const text = formatContent(result.op, state);
+			let text = formatContent(result.op, state);
+			// 放宽 activeForm 后：提示但不阻断，让模型下次补上标签。
+			let justEnteredInProgress = false;
+			let inProgressId: number | undefined;
+			if (result.op.kind === "update") {
+				if (result.op.toStatus === "in_progress") {
+					justEnteredInProgress = true;
+					inProgressId = result.op.id;
+				}
+			} else if (result.op.kind === "create") {
+				const taskId = result.op.taskId;
+				const createdTask = state.tasks.find((t) => t.id === taskId);
+				if (createdTask && createdTask.status === "in_progress") {
+					justEnteredInProgress = true;
+					inProgressId = createdTask.id;
+				}
+			}
+			if (justEnteredInProgress && inProgressId !== undefined) {
+				const inProgressTask = state.tasks.find((t) => t.id === inProgressId);
+				if (inProgressTask && !inProgressTask.activeForm) {
+					text += "\nTip: pass activeForm (e.g. 'researching existing tool') to label this task in the overlay.";
+				}
+			}
+			// Only mutations store the full snapshot; read-only calls would just
+			// duplicate the same state over and over and bloat the session file.
+			const isReadOnly = result.op.kind === "list" || result.op.kind === "get";
 			const details: TaskDetails = {
 				action: normalized.action,
-				params: normalized.params,
+				// write already stores the merged task list; dropping the duplicate
+				// todos array saves space in the snapshot.
+				params:
+					result.op.kind === "write"
+						? { ...normalized.params, todos: undefined }
+						: normalized.params,
 				...(normalized.diagnostics ? { normalization: normalized.diagnostics } : {}),
-				tasks: state.tasks,
-				nextId: state.nextId,
+				...(isReadOnly ? {} : { version: 1, tasks: state.tasks, nextId: state.nextId }),
 			};
 			return { content: [{ type: "text", text }], details };
 		},
@@ -1391,7 +1690,8 @@ export default function (pi: ExtensionAPI) {
 			if (args.todos) {
 				text += ` ${theme.fg("dim", `${(args.todos as unknown[]).length} items`)}`;
 			} else if ((args.action === "create" || args.action === undefined) && (args.subject || args.content)) {
-				text += ` ${theme.fg("dim", (args.subject ?? args.content) as string)}`;
+				// args.content may be up to 10k chars; keep the TUI row short.
+				text += ` ${theme.fg("dim", String(args.subject ?? args.content).slice(0, 200))}`;
 			} else if (
 				(args.action === "update" || args.action === "get" || args.action === "delete") &&
 				args.id !== undefined
@@ -1415,15 +1715,15 @@ export default function (pi: ExtensionAPI) {
 				case "write":
 					break;
 				case "create":
-					status = details.tasks[details.tasks.length - 1]?.status;
+					status = details.tasks ? details.tasks[details.tasks.length - 1]?.status : undefined;
 					break;
 				case "update": {
 					const params = details.params;
-					status = (params.status as TaskStatus) ?? details.tasks.find((t) => t.id === params.id)?.status;
+					status = (params.status as TaskStatus) ?? details.tasks?.find((t) => t.id === params.id)?.status;
 					break;
 				}
 				case "delete":
-					status = details.tasks.find((t) => t.id === details.params.id)?.status;
+					status = details.tasks?.find((t) => t.id === details.params.id)?.status;
 					break;
 				case "list":
 				case "get":
