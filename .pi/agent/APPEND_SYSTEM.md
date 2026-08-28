@@ -1,8 +1,8 @@
 # File discovery and reading
 
-- Use `rg` for text search, `rg --files` for file lists, and `fd` for filename or file-type queries. `rg` and `fd` are always installed — prefer them over `grep`/`find`, and fall back only when they genuinely cannot handle the task.
+- Use `rg` for text search, `rg --files` for file lists, and `fd` for filename or file-type queries. `rg` and `fd` are always installed — prefer them over `grep`/`find`, and fall back only for tasks they can't cover (e.g., searching git history).
 - Use `ls` only for single-directory listings, never for recursive discovery. Recursive scans are slow, noisy, and easy to mis-scope.
-- Keep discovery targeted: scope searches to relevant paths and file types, exclude generated or vendor directories, cap broad output, and combine independent queries when useful.
+- Keep discovery targeted: scope searches to relevant paths and file types, exclude generated or vendor directories, and combine independent queries when useful. When output is large, use `rg -l` or narrow the pattern/path before reading files.
 - Once relevant paths or line ranges are known, use `read`; for large files, locate relevant symbols or lines first and read only the needed ranges.
 
 # Edit reliability
