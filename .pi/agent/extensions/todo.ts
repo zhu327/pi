@@ -35,6 +35,13 @@
  * - entering in_progress without activeForm now succeeds with a tip in
  *   the tool result instead of failing the call
  *
+ * Session-driven hardening (2026-08-28, from 357 calls / 29 errors):
+ * - TodoWrite batches treat stale/guessed ids as hints: an exact unique
+ *   subject match wins, otherwise a missing id creates a task and batch-local
+ *   blockedBy references are remapped to the allocated id
+ * - completed tasks may be reopened; starting a different task automatically
+ *   pauses the previous in_progress task instead of rejecting the call
+ *
  * Review fixes (2026-08-24):
  * - renderCall truncates a recovered non-action `action` string (subject
  *   text) so the TUI row stays one line
@@ -135,7 +142,10 @@ const ACTION_GLYPH: Record<TaskAction, string> = {
 const VALID_TRANSITIONS: Record<TaskStatus, ReadonlySet<TaskStatus>> = {
 	pending: new Set(["in_progress", "completed", "deleted"]),
 	in_progress: new Set(["pending", "completed", "deleted"]),
-	completed: new Set(["deleted"]),
+	// Models regularly resume a completed checklist item when follow-up work is
+	// discovered. Reopening is safer than forcing a duplicate task; deleted
+	// tombstones remain the only terminal state.
+	completed: new Set(["in_progress", "deleted"]),
 	deleted: new Set(),
 };
 
@@ -242,7 +252,7 @@ function selectByStatus(state: TaskState) {
 type Op =
 	| { kind: "write"; created: number[]; updated: number[]; unchanged: number }
 	| { kind: "create"; taskId: number }
-	| { kind: "update"; id: number; fromStatus: TaskStatus; toStatus: TaskStatus }
+	| { kind: "update"; id: number; fromStatus: TaskStatus; toStatus: TaskStatus; pausedTaskId?: number }
 	| { kind: "delete"; id: number; subject: string }
 	| { kind: "list"; statusFilter?: TaskStatus; includeDeleted: boolean }
 	| { kind: "get"; task: Task }
@@ -607,14 +617,20 @@ function applyTodoMerge(state: TaskState, value: unknown): ApplyResult {
 	const claimed = new Set<number>();
 	const created: number[] = [];
 	const updated: number[] = [];
-	let unchanged = 0;
+	const unchangedIds = new Set<number>();
 	const statusUpdates: Array<{ index: number; id: number; status: TaskStatus }> = [];
+	// Models often invent sequential ids when starting a fresh/replacement
+	// checklist. Keep those ids usable inside this batch (especially blockedBy)
+	// while storing the allocator's canonical ids.
+	const batchIdAliases = new Map<number, number>();
+	const resolveBatchId = (id: number): number => batchIdAliases.get(id) ?? id;
 	// All blockedBy edits — for existing AND new tasks — are applied after every
 	// create has run, so a task may depend on one created later in this batch.
 	const deferredBlockedBy: Array<{ index: number; id: number; add: number[]; remove: number[] }> = [];
 	// Task id → item index for items that explicitly passed an empty activeForm.
 	const explicitEmptyActiveForm = new Map<number, number>();
 	const markUpdated = (id: number): void => {
+		unchangedIds.delete(id);
 		if (!created.includes(id) && !updated.includes(id)) updated.push(id);
 	};
 
@@ -662,12 +678,26 @@ function applyTodoMerge(state: TaskState, value: unknown): ApplyResult {
 		}
 
 		let existing: Task | undefined;
+		let requestedId: number | undefined;
 		if (item.id !== undefined) {
 			if (typeof item.id !== "number" || !Number.isInteger(item.id) || item.id < 1) {
 				return errorResult(state, `todos[${index}].id must be a positive integer`);
 			}
-			existing = working.tasks.find((task) => task.id === item.id);
-			if (!existing) return errorResult(state, `todos[${index}]: #${item.id} not found`);
+			requestedId = item.id;
+			existing = working.tasks.find((task) => task.id === resolveBatchId(item.id as number));
+			// In TodoWrite-shaped batches, generated ids are frequently stale after
+			// an earlier list was replaced. A unique exact subject is stronger
+			// evidence than an id that is missing or points at a different subject.
+			if (subject && (!existing || existing.subject !== subject)) {
+				const matches = working.tasks.filter(
+					(task) => task.status !== "deleted" && task.subject === subject && !created.includes(task.id),
+				);
+				if (matches.length > 1) {
+					return errorResult(state, `todos[${index}] subject ${JSON.stringify(subject)} is ambiguous; pass the current id`);
+				}
+				if (matches.length === 1) existing = matches[0];
+				else existing = undefined; // stale/missing hinted id means create
+			}
 		} else {
 			if (!subject) return errorResult(state, `todos[${index}] requires subject/content when id is omitted`);
 			// Id-less items upsert by subject, but only against tasks that existed
@@ -684,6 +714,7 @@ function applyTodoMerge(state: TaskState, value: unknown): ApplyResult {
 		}
 
 		if (existing) {
+			if (requestedId !== undefined) batchIdAliases.set(requestedId, existing.id);
 			if (claimed.has(existing.id)) return errorResult(state, `todos[${index}] targets #${existing.id} more than once`);
 			claimed.add(existing.id);
 			const effectiveDescription =
@@ -718,7 +749,7 @@ function applyTodoMerge(state: TaskState, value: unknown): ApplyResult {
 				markUpdated(existing.id);
 			}
 			if (!hasFieldChanges && !hasStatusChange && !blockedByDeferred) {
-				unchanged += 1;
+				unchangedIds.add(existing.id);
 			}
 			if (item.activeForm !== undefined && normalizeActiveForm(item.activeForm) === "") {
 				explicitEmptyActiveForm.set(existing.id, index);
@@ -742,6 +773,7 @@ function applyTodoMerge(state: TaskState, value: unknown): ApplyResult {
 		if (result.op.kind !== "create") return errorResult(state, `todos[${index}]: internal error`);
 		working = result.state;
 		const id = result.op.taskId;
+		if (requestedId !== undefined) batchIdAliases.set(requestedId, id);
 		claimed.add(id);
 		created.push(id);
 		if (deferredBlocked) deferredBlockedBy.push({ index, id, add: deferredBlocked, remove: [] });
@@ -755,7 +787,9 @@ function applyTodoMerge(state: TaskState, value: unknown): ApplyResult {
 	// dependencies on tasks created later in the same batch resolve cleanly.
 	for (const deferred of deferredBlockedBy) {
 		const update: Record<string, unknown> = { id: deferred.id };
-		if (deferred.add.length) update.addBlockedBy = deferred.add;
+		if (deferred.add.length) update.addBlockedBy = deferred.add.map(resolveBatchId);
+		// Removals were derived from canonical existing-state ids, not from the
+		// caller's hinted ids, so they must not pass through the alias map.
 		if (deferred.remove.length) update.removeBlockedBy = deferred.remove;
 		const result = applyMutation(working, "update", update);
 		if (result.op.kind === "error") return errorResult(state, `todos[${deferred.index}]: ${result.op.message}`);
@@ -787,6 +821,9 @@ function applyTodoMerge(state: TaskState, value: unknown): ApplyResult {
 			} else {
 				working = result.state;
 				markUpdated(change.id);
+				if (result.op.kind === "update" && result.op.pausedTaskId !== undefined) {
+					markUpdated(result.op.pausedTaskId);
+				}
 				progressed = true;
 			}
 		}
@@ -806,7 +843,7 @@ function applyTodoMerge(state: TaskState, value: unknown): ApplyResult {
 	const invariantError = validateState(working);
 	if (invariantError) return errorResult(state, `internal invariant violation: ${invariantError}`);
 
-	return { state: working, op: { kind: "write", created, updated, unchanged } };
+	return { state: working, op: { kind: "write", created, updated, unchanged: unchangedIds.size } };
 }
 
 function applyMutation(state: TaskState, action: TaskAction, params: Record<string, unknown>): ApplyResult {
@@ -899,19 +936,11 @@ function applyMutation(state: TaskState, action: TaskAction, params: Record<stri
 						);
 					}
 				}
-				// T-2: at most one in_progress task at a time.
-				if (target === "in_progress" && current.status !== "in_progress") {
-					const other = findOtherInProgress(state.tasks, current.id);
-					if (other) {
-						return errorResult(
-							state,
-							`#${other.id} "${other.subject}" is already in_progress; only one task may be in_progress at a time — finish it or set it back to pending first`,
-						);
-					}
-					// 附加(放宽): activeForm is preferred when entering in_progress,
-					// but no longer required — the tool result adds a tip instead.
-					// (An explicitly passed empty activeForm is still rejected below.)
-				}
+				// T-2: at most one in_progress task at a time. Model-generated
+				// checklists frequently forget to close the previous active item;
+				// conservatively pause it rather than guessing that it completed.
+				// activeForm is preferred when entering in_progress, but omission is
+				// allowed; an explicitly empty activeForm is still rejected below.
 				newStatus = target;
 			}
 
@@ -972,13 +1001,22 @@ function applyMutation(state: TaskState, action: TaskAction, params: Record<stri
 			else delete updated.blockedBy;
 
 			const newTasks = [...state.tasks];
+			let pausedTaskId: number | undefined;
+			if (newStatus === "in_progress" && current.status !== "in_progress") {
+				const other = findOtherInProgress(state.tasks, current.id);
+				if (other) {
+					const otherIdx = newTasks.findIndex((task) => task.id === other.id);
+					newTasks[otherIdx] = { ...other, status: "pending" };
+					pausedTaskId = other.id;
+				}
+			}
 			newTasks[idx] = updated;
 			const newState: TaskState = { tasks: newTasks, nextId: state.nextId };
 			const invariantError = validateState(newState);
 			if (invariantError) return errorResult(state, `internal invariant violation: ${invariantError}`);
 			return {
 				state: newState,
-				op: { kind: "update", id: updated.id, fromStatus: current.status, toStatus: newStatus },
+				op: { kind: "update", id: updated.id, fromStatus: current.status, toStatus: newStatus, pausedTaskId },
 			};
 		}
 
@@ -1084,7 +1122,8 @@ function formatContent(op: Op, state: TaskState): string {
 		}
 		case "update": {
 			const transition = op.fromStatus !== op.toStatus ? ` (${op.fromStatus} → ${op.toStatus})` : "";
-			return `Updated #${op.id}${transition}`;
+			const paused = op.pausedTaskId !== undefined ? `; paused previous in_progress task #${op.pausedTaskId}` : "";
+			return `Updated #${op.id}${transition}${paused}`;
 		}
 		case "delete":
 			return `Deleted #${op.id}: ${op.subject}`;
@@ -1638,14 +1677,14 @@ export default function (pi: ExtensionAPI) {
 		name: "todo",
 		label: "Todo",
 		description:
-			"Manage a task list for multi-step work. For initial/multiple tasks, pass one todos array (batch merge/upsert; omitted existing tasks are preserved). For individual operations use action: create, update, list, get, delete, or clear. subject and the TodoWrite-style content alias are both accepted. Status: pending → in_progress → completed, plus deleted tombstone. list output is capped at ~40KB; use get with id or a status filter to narrow large lists.",
+			"Manage a task list for multi-step work. For initial/multiple tasks, pass one todos array (batch merge/upsert; omitted existing tasks are preserved). In batches, omit ids for new tasks; stale ids are treated as hints and recovered by exact subject or creation. For individual operations use action: create, update, list, get, delete, or clear. subject and the TodoWrite-style content alias are both accepted. Status: pending → in_progress → completed (completed may reopen), plus deleted tombstone. Starting a task pauses any previous in_progress task. list output is capped at ~40KB; use get with id or a status filter to narrow large lists.",
 		promptSnippet: "Manage a task list to track multi-step progress",
 		promptGuidelines: [
 			"Use `todo` for complex work with 3+ steps, when the user gives you a list of tasks, or immediately after receiving new instructions to capture requirements. Skip it for single trivial tasks and purely conversational requests.",
-			"When creating the initial list or multiple tasks, prefer one call with `todos` instead of several parallel create calls. `todos` merges by id or exact subject/content and never deletes omitted tasks. Use action-based calls for later single-task status, dependency, and deletion changes.",
+			"When creating the initial list or multiple tasks, prefer one call with `todos` instead of several parallel create calls. Omit ids for new tasks; ids in `todos` are hints and stale ids fall back to exact subject matching or creation. `todos` never deletes omitted tasks. Use action-based calls for later single-task status, dependency, and deletion changes.",
 			"When starting any task, mark it in_progress BEFORE beginning work. Mark it completed IMMEDIATELY when done — never batch completions. Exactly one task should be in_progress at a time.",
 			"Never mark a task completed if tests are failing, the implementation is partial, or you hit unresolved errors — keep it in_progress and create a new task for the blocker instead.",
-			"Task status is a 4-state machine: pending → in_progress → completed, plus deleted as a tombstone. Pass activeForm (present-continuous label, e.g. 'researching existing tool') when marking in_progress.",
+			"Task status uses pending → in_progress → completed, with completed → in_progress allowed for follow-up work; deleted is an immutable tombstone. Pass activeForm (present-continuous label, e.g. 'researching existing tool') when marking in_progress.",
 			"Use blockedBy to express dependencies (A is blocked by B). On create, pass blockedBy as the initial set. On update, use addBlockedBy / removeBlockedBy (additive merge — do not resend the full array). Cycles are rejected.",
 			"list hides tombstoned (deleted) tasks by default; pass includeDeleted:true to see them. Pass status to filter by a single status. list output is capped (~40KB) — narrow large lists with get/status filter.",
 			"Subject must be short and imperative (max 200 chars; e.g. 'Research existing tool'); description is for long-form detail. activeForm is a present-continuous label shown while in_progress.",
