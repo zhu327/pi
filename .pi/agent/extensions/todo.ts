@@ -1113,7 +1113,28 @@ function formatContent(op: Op, state: TaskState): string {
 		case "write": {
 			const parts = [`${op.created.length} created`, `${op.updated.length} updated`];
 			if (op.unchanged > 0) parts.push(`${op.unchanged} unchanged`);
-			return `Merged ${op.created.length + op.updated.length + op.unchanged} todos (${parts.join(", ")})`;
+			let text = `Merged ${op.created.length + op.updated.length + op.unchanged} todos (${parts.join(", ")})`;
+			// Echo canonical ids: models only see this text (snapshots live in
+			// details), so an id-less append would otherwise force them to guess
+			// ids on the next update — the main source of wrong-task updates.
+			// todos[] is capped at 50 items × 200-char subjects (~12KB), well
+			// under the tool-result budget, so no truncation is needed here.
+			const byId = new Map(state.tasks.map((t) => [t.id, t]));
+			if (op.created.length > 0) {
+				text += "\nCreated:";
+				for (const id of op.created) {
+					const t = byId.get(id);
+					text += `\n+ #${id}${t ? ` ${t.subject} (${t.status})` : ""}`;
+				}
+			}
+			if (op.updated.length > 0) {
+				text += "\nUpdated:";
+				for (const id of op.updated) {
+					const t = byId.get(id);
+					text += `\n~ #${id}${t ? ` ${t.subject} (${t.status})` : ""}`;
+				}
+			}
+			return text;
 		}
 		case "create": {
 			const t = state.tasks.find((x) => x.id === op.taskId);
@@ -1681,7 +1702,7 @@ export default function (pi: ExtensionAPI) {
 		promptSnippet: "Manage a task list to track multi-step progress",
 		promptGuidelines: [
 			"Use `todo` for complex work with 3+ steps, when the user gives you a list of tasks, or immediately after receiving new instructions to capture requirements. Skip it for single trivial tasks and purely conversational requests.",
-			"When creating the initial list or multiple tasks, prefer one call with `todos` instead of several parallel create calls. Omit ids for new tasks; ids in `todos` are hints and stale ids fall back to exact subject matching or creation. `todos` never deletes omitted tasks. Use action-based calls for later single-task status, dependency, and deletion changes.",
+			"When creating the initial list or multiple tasks, prefer one call with `todos` instead of several parallel create calls. Omit ids for new tasks; the result echoes the allocated canonical ids (`+ #N subject`) — always use those ids for later updates, never invent your own. Ids in `todos` are hints and stale ids fall back to exact subject matching or creation. `todos` never deletes omitted tasks. Use action-based calls for later single-task status, dependency, and deletion changes.",
 			"When starting any task, mark it in_progress BEFORE beginning work. Mark it completed IMMEDIATELY when done — never batch completions. Exactly one task should be in_progress at a time.",
 			"Never mark a task completed if tests are failing, the implementation is partial, or you hit unresolved errors — keep it in_progress and create a new task for the blocker instead.",
 			"Task status uses pending → in_progress → completed, with completed → in_progress allowed for follow-up work; deleted is an immutable tombstone. Pass activeForm (present-continuous label, e.g. 'researching existing tool') when marking in_progress.",
