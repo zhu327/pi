@@ -234,7 +234,7 @@ export default function question(pi: ExtensionAPI) {
 		// Q-5: two concurrent question calls must not fight over dialog focus.
 		executionMode: "sequential",
 
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			// Q-7: parameter errors throw — they are tool errors, not user
 			// cancellations.
 			if (params.questions.length === 0) throw new Error("No questions provided");
@@ -288,6 +288,11 @@ export default function question(pi: ExtensionAPI) {
 				};
 			});
 
+			if (signal?.aborted) {
+				const cancelled = createCancelledResult(questions);
+				return { content: [{ type: "text", text: "User cancelled the question" }], details: cancelled };
+			}
+
 			// Q-3: only an interactive TUI can run the dialog. RPC/print/JSON
 			// modes (even with hasUI) get the text fallback instead of a
 			// false "user cancelled" result.
@@ -308,10 +313,23 @@ export default function question(pi: ExtensionAPI) {
 			});
 
 			let result: QuestionnaireResult;
+			let abortHandler: (() => void) | undefined;
 			// Q-8: global working visibility is never touched here.
-			result =
-				(await ctx.ui.custom<QuestionnaireResult>((tui, theme, _keybindings, done) => {
-					let currentTabIndex = 0;
+			try {
+				result =
+					(await ctx.ui.custom<QuestionnaireResult>((tui, theme, _keybindings, doneFromUi) => {
+						let dialogSettled = false;
+						const done = (value: QuestionnaireResult) => {
+							if (dialogSettled) return;
+							dialogSettled = true;
+							doneFromUi(value);
+						};
+						if (signal) {
+							abortHandler = () => done(createCancelledResult(questions));
+							signal.addEventListener("abort", abortHandler, { once: true });
+							if (signal.aborted) abortHandler();
+						}
+						let currentTabIndex = 0;
 					let optionIndex = 0;
 					let submitPickerIndex = 0;
 					let inputMode: InputMode = null;
@@ -873,6 +891,9 @@ export default function question(pi: ExtensionAPI) {
 
 					return dialog;
 				})) ?? createCancelledResult(questions);
+			} finally {
+				if (abortHandler && signal) signal.removeEventListener("abort", abortHandler);
+			}
 
 			if (result.cancelled) {
 				const message = result.chatRequested ? "User chose to chat about the questions" : "User cancelled the question";

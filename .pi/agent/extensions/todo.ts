@@ -11,9 +11,9 @@
  * - Improved /todos command with status grouping and counts
  * - Transition validation (e.g. can't go from completed back to in_progress)
  *
- * State is stored in tool result details (not external files), which allows
- * proper branching — when you branch, the todo state is automatically
- * correct for that point in history.
+ * State is stored as versioned mutation records in tool result details (not
+ * external files), which allows proper branching without duplicating the full
+ * task array on every mutation. Legacy v1 snapshots remain readable.
  *
  * REFACTOR_PLAN.md tasks implemented: T-1 (sequential execution), T-2
  * (single in_progress), T-3 (blockedBy gates transitions), T-4 (delete
@@ -90,11 +90,13 @@ interface TaskDetails {
 	action: TaskAction;
 	params: Record<string, unknown>;
 	normalization?: NormalizationDetails;
-	/** Snapshot version; present on mutation results that carry the full state. */
+	/** v1 is a full-state snapshot; v2 stores a mutation delta for compact session history. */
 	version?: number;
-	/** Full task snapshot — stored on mutations only, so read-only calls don't bloat the session. */
+	/** Legacy v1 snapshot fields, retained for backward-compatible restore/rendering. */
 	tasks?: Task[];
 	nextId?: number;
+	/** Result status used by the compact v2 renderer. */
+	resultStatus?: TaskStatus;
 }
 
 type TaskAction = "write" | "create" | "update" | "list" | "get" | "delete" | "clear";
@@ -150,6 +152,8 @@ const VALID_TRANSITIONS: Record<TaskStatus, ReadonlySet<TaskStatus>> = {
 };
 
 const VALID_STATUSES: ReadonlySet<string> = new Set(["pending", "in_progress", "completed", "deleted"]);
+const MAX_TASKS = 500;
+const MAX_BLOCKED_BY = 100;
 
 function isTransitionValid(from: TaskStatus, to: TaskStatus): boolean {
 	if (from === to) return true;
@@ -731,6 +735,7 @@ function applyTodoMerge(state: TaskState, value: unknown): ApplyResult {
 			if (item.blockedBy !== undefined) {
 				const desired = normalizeIds(item.blockedBy);
 				if (desired === null) return errorResult(state, `todos[${index}].blockedBy must contain positive integer ids`);
+				if (desired.length > MAX_BLOCKED_BY) return errorResult(state, `todos[${index}].blockedBy exceeds ${MAX_BLOCKED_BY} ids`);
 				const current = new Set(existing.blockedBy ?? []);
 				const wanted = new Set(desired);
 				const add = desired.filter((id) => !current.has(id));
@@ -766,6 +771,7 @@ function applyTodoMerge(state: TaskState, value: unknown): ApplyResult {
 		if (item.blockedBy !== undefined) {
 			const desired = normalizeIds(item.blockedBy);
 			if (desired === null) return errorResult(state, `todos[${index}].blockedBy must contain positive integer ids`);
+			if (desired.length > MAX_BLOCKED_BY) return errorResult(state, `todos[${index}].blockedBy exceeds ${MAX_BLOCKED_BY} ids`);
 			if (desired.length > 0) deferredBlocked = desired;
 		}
 		const result = applyMutation(working, "create", create);
@@ -854,6 +860,9 @@ function applyMutation(state: TaskState, action: TaskAction, params: Record<stri
 		case "create": {
 			const subject = normalizeSubject(params.subject);
 			if (!subject) return errorResult(state, "subject required for create");
+			if (state.tasks.length >= MAX_TASKS) {
+				return errorResult(state, `task limit reached (${MAX_TASKS}); clear the list before creating more`);
+			}
 			if (subject.length > 200) {
 				return errorResult(state, "subject cannot exceed 200 characters; put long text in description");
 			}
@@ -864,6 +873,9 @@ function applyMutation(state: TaskState, action: TaskAction, params: Record<stri
 			const blockedBy = params.blockedBy !== undefined ? normalizeIds(params.blockedBy) : [];
 			if (blockedBy === null) {
 				return errorResult(state, "blockedBy must be an array of positive integer task ids");
+			}
+			if (blockedBy.length > MAX_BLOCKED_BY) {
+				return errorResult(state, `blockedBy cannot contain more than ${MAX_BLOCKED_BY} task ids`);
 			}
 			for (const dep of blockedBy) {
 				const depTask = state.tasks.find((t) => t.id === dep);
@@ -944,14 +956,20 @@ function applyMutation(state: TaskState, action: TaskAction, params: Record<stri
 				newStatus = target;
 			}
 
-			let newBlockedBy = current.blockedBy ? [...current.blockedBy] : [];
 			const removeBlockedBy = params.removeBlockedBy as number[] | undefined;
+			if (removeBlockedBy && removeBlockedBy.length > MAX_BLOCKED_BY) {
+				return errorResult(state, `removeBlockedBy cannot contain more than ${MAX_BLOCKED_BY} task ids`);
+			}
+			let newBlockedBy = current.blockedBy ? [...current.blockedBy] : [];
 			if (removeBlockedBy?.length) {
 				const toRemove = new Set(removeBlockedBy);
 				newBlockedBy = newBlockedBy.filter((dep) => !toRemove.has(dep));
 			}
 			const addBlockedBy = params.addBlockedBy as number[] | undefined;
 			if (addBlockedBy?.length) {
+				if (addBlockedBy.length > MAX_BLOCKED_BY) {
+					return errorResult(state, `addBlockedBy cannot contain more than ${MAX_BLOCKED_BY} task ids`);
+				}
 				for (const dep of addBlockedBy) {
 					if (dep === current.id) return errorResult(state, `cannot block #${current.id} on itself`);
 					const depTask = state.tasks.find((t) => t.id === dep);
@@ -969,6 +987,9 @@ function applyMutation(state: TaskState, action: TaskAction, params: Record<stri
 			const blockedByChanged =
 				(params.addBlockedBy !== undefined && (params.addBlockedBy as unknown[]).length > 0) ||
 				(params.removeBlockedBy !== undefined && (params.removeBlockedBy as unknown[]).length > 0);
+			if (addBlockedBy?.length && newBlockedBy.length > MAX_BLOCKED_BY) {
+				return errorResult(state, `blockedBy cannot contain more than ${MAX_BLOCKED_BY} task ids`);
+			}
 			if (
 				(newStatus === "in_progress" || newStatus === "completed") &&
 				(current.status !== newStatus || blockedByChanged)
@@ -1195,7 +1216,7 @@ const TodoItemParams = Type.Object({
 	status: Type.Optional(
 		Type.String({ description: "pending | in_progress | completed; common aliases such as todo, doing, done are normalized" }),
 	),
-	blockedBy: Type.Optional(Type.Array(Type.Integer({ minimum: 1 }), { uniqueItems: true })),
+	blockedBy: Type.Optional(Type.Array(Type.Integer({ minimum: 1 }), { uniqueItems: true, maxItems: MAX_BLOCKED_BY })),
 });
 
 const TodoParams = Type.Object({
@@ -1235,18 +1256,21 @@ const TodoParams = Type.Object({
 	blockedBy: Type.Optional(
 		Type.Array(Type.Integer({ minimum: 1 }), {
 			uniqueItems: true,
+			maxItems: MAX_BLOCKED_BY,
 			description: "Initial blockedBy ids (create only)",
 		}),
 	),
 	addBlockedBy: Type.Optional(
 		Type.Array(Type.Integer({ minimum: 1 }), {
 			uniqueItems: true,
+			maxItems: MAX_BLOCKED_BY,
 			description: "Task ids to add to blockedBy (update only, additive merge)",
 		}),
 	),
 	removeBlockedBy: Type.Optional(
 		Type.Array(Type.Integer({ minimum: 1 }), {
 			uniqueItems: true,
+			maxItems: MAX_BLOCKED_BY,
 			description: "Task ids to remove from blockedBy (update only)",
 		}),
 	),
@@ -1264,8 +1288,9 @@ const TodoParams = Type.Object({
 
 const WIDGET_KEY = "todo-overlay";
 const MAX_WIDGET_LINES = 12;
-// Keep list tool output well under Pi's ~50KB tool-result budget.
+// Keep list and command output bounded, and cap aggregate task/dependency state.
 const MAX_LIST_OUTPUT_BYTES = 40 * 1024;
+const MAX_TODOS_COMMAND_TASKS = 100;
 
 interface WidgetRenderCache {
 	width: number;
@@ -1536,23 +1561,26 @@ class TodoListComponent {
 			lines.push(truncateToWidth(`  ${th.fg("muted", headerParts.join(" · "))}`, width));
 			lines.push("");
 
-			if (groups.pending.length > 0) {
-				lines.push(truncateToWidth(`  ${th.fg("dim", "── Pending ──")}`, width));
-				for (const t of groups.pending) {
-					lines.push(truncateToWidth(formatCommandLine(t, "○", th), width));
+			const sections = [
+				{ heading: "── Pending ──", color: "dim" as const, glyph: "○", tasks: groups.pending },
+				{ heading: "── In Progress ──", color: "warning" as const, glyph: "◐", tasks: groups.inProgress },
+				{ heading: "── Completed ──", color: "success" as const, glyph: "✓", tasks: groups.completed },
+			];
+			let shown = 0;
+			let hidden = 0;
+			for (const section of sections) {
+				if (section.tasks.length === 0) continue;
+				const visibleTasks = section.tasks.slice(0, Math.max(0, MAX_TODOS_COMMAND_TASKS - shown));
+				hidden += section.tasks.length - visibleTasks.length;
+				if (visibleTasks.length === 0) continue;
+				lines.push(truncateToWidth(`  ${th.fg(section.color, section.heading)}`, width));
+				for (const task of visibleTasks) {
+					lines.push(truncateToWidth(formatCommandLine(task, section.glyph, th), width));
 				}
+				shown += visibleTasks.length;
 			}
-			if (groups.inProgress.length > 0) {
-				lines.push(truncateToWidth(`  ${th.fg("warning", "── In Progress ──")}`, width));
-				for (const t of groups.inProgress) {
-					lines.push(truncateToWidth(formatCommandLine(t, "◐", th), width));
-				}
-			}
-			if (groups.completed.length > 0) {
-				lines.push(truncateToWidth(`  ${th.fg("success", "── Completed ──")}`, width));
-				for (const t of groups.completed) {
-					lines.push(truncateToWidth(formatCommandLine(t, "✓", th), width));
-				}
+			if (hidden > 0) {
+				lines.push(truncateToWidth(`  ${th.fg("dim", `${hidden} more tasks omitted; use todo action:list/get`)}`, width));
 			}
 		}
 
@@ -1579,6 +1607,54 @@ function formatCommandLine(t: Task, glyph: string, theme: Theme): string {
 	return `  ${glyph} ${theme.fg("accent", `#${t.id}`)} ${subject}${form}${block}`;
 }
 
+function formatTodosCommandText(state: TaskState): string {
+	const counts = selectCounts(state);
+	if (counts.total === 0) return "No todos yet. Ask the agent to add some!";
+
+	const headerParts: string[] = [];
+	if (counts.completed > 0) headerParts.push(`${counts.completed}/${counts.total} completed`);
+	if (counts.inProgress > 0) headerParts.push(`${counts.inProgress} in progress`);
+	if (counts.pending > 0) headerParts.push(`${counts.pending} pending`);
+	const lines = [headerParts.join(" · ")];
+	let bytes = Buffer.byteLength(lines[0] ?? "", "utf8") + 1;
+	let shown = 0;
+	let hidden = 0;
+	const groups = selectByStatus(state);
+	const sections = [
+		{ heading: "── Pending ──", glyph: "○", tasks: groups.pending },
+		{ heading: "── In Progress ──", glyph: "◐", tasks: groups.inProgress },
+		{ heading: "── Completed ──", glyph: "✓", tasks: groups.completed },
+	];
+	const outputBudget = MAX_LIST_OUTPUT_BYTES - 512;
+
+	for (const section of sections) {
+		if (section.tasks.length === 0) continue;
+		const headingBytes = Buffer.byteLength(section.heading, "utf8") + 1;
+		if (shown >= MAX_TODOS_COMMAND_TASKS || bytes + headingBytes > outputBudget) {
+			hidden += section.tasks.length;
+			continue;
+		}
+		lines.push(section.heading);
+		bytes += headingBytes;
+		let index = 0;
+		for (; index < section.tasks.length; index++) {
+			const task = section.tasks[index]!;
+			const line = `  ${section.glyph} #${task.id} ${task.subject}`;
+			const lineBytes = Buffer.byteLength(line, "utf8") + 1;
+			if (shown >= MAX_TODOS_COMMAND_TASKS || bytes + lineBytes > outputBudget) break;
+			lines.push(line);
+			bytes += lineBytes;
+			shown++;
+		}
+		hidden += section.tasks.length - index;
+	}
+
+	if (hidden > 0) {
+		lines.push(`[output truncated: ${hidden} tasks hidden; use todo action:list or action:get for details]`);
+	}
+	return lines.join("\n");
+}
+
 // ---------------------------------------------------------------------------
 // Extension entry point
 // ---------------------------------------------------------------------------
@@ -1593,9 +1669,9 @@ export default function (pi: ExtensionAPI) {
 	const overlay = new TodoOverlay();
 
 	/**
-	 * Parse and validate a persisted snapshot. Snapshots from unknown versions
-	 * or with corrupt shapes/invariants return undefined so reconstruction falls
-	 * back to the last valid snapshot instead of loading broken state.
+	 * Parse legacy v1 snapshots. Unknown versions or corrupt shapes/invariants
+	 * return undefined so reconstruction can ignore them and continue from the
+	 * last valid state/delta rather than loading a broken snapshot.
 	 */
 	const parseSnapshot = (details: unknown): TaskState | undefined => {
 		if (!details || typeof details !== "object") return undefined;
@@ -1634,8 +1710,24 @@ export default function (pi: ExtensionAPI) {
 			if (entry.type !== "message") continue;
 			const msg = entry.message;
 			if (msg.role !== "toolResult" || msg.toolName !== "todo") continue;
-			const snapshot = parseSnapshot(msg.details);
-			if (snapshot) result = snapshot;
+			const details = msg.details as TaskDetails | undefined;
+			const snapshot = parseSnapshot(details);
+			if (snapshot) {
+				result = snapshot;
+				continue;
+			}
+			// v2 mutation records replay the operation instead of copying the
+			// entire task array into every tool result. Legacy v1 snapshots above
+			// remain valid checkpoints for existing sessions.
+			if (
+				details?.version === 2 &&
+				details.params !== null &&
+				typeof details.params === "object" &&
+				!Array.isArray(details.params)
+			) {
+				const replayed = applyMutation(result, details.action, details.params);
+				if (replayed.op.kind !== "error") result = replayed.state;
+			}
 		}
 		state = result;
 	};
@@ -1698,7 +1790,7 @@ export default function (pi: ExtensionAPI) {
 		name: "todo",
 		label: "Todo",
 		description:
-			"Manage a task list for multi-step work. For initial/multiple tasks, pass one todos array (batch merge/upsert; omitted existing tasks are preserved). In batches, omit ids for new tasks; stale ids are treated as hints and recovered by exact subject or creation. For individual operations use action: create, update, list, get, delete, or clear. subject and the TodoWrite-style content alias are both accepted. Status: pending → in_progress → completed (completed may reopen), plus deleted tombstone. Starting a task pauses any previous in_progress task. list output is capped at ~40KB; use get with id or a status filter to narrow large lists.",
+			"Manage a task list for multi-step work. For initial/multiple tasks, pass one todos array (batch merge/upsert; omitted existing tasks are preserved). In batches, omit ids for new tasks; stale ids are treated as hints and recovered by exact subject or creation. For individual operations use action: create, update, list, get, delete, or clear. subject and the TodoWrite-style content alias are both accepted. Status: pending → in_progress → completed (completed may reopen), plus deleted tombstone. Starting a task pauses any previous in_progress task. A session is limited to 500 tasks and 100 dependencies per task; list output is capped at ~40KB and /todos shows at most 100 tasks. Use get with id or a status filter to narrow large lists.",
 		promptSnippet: "Manage a task list to track multi-step progress",
 		promptGuidelines: [
 			"Use `todo` for complex work with 3+ steps, when the user gives you a list of tasks, or immediately after receiving new instructions to capture requirements. Skip it for single trivial tasks and purely conversational requests.",
@@ -1707,7 +1799,7 @@ export default function (pi: ExtensionAPI) {
 			"Never mark a task completed if tests are failing, the implementation is partial, or you hit unresolved errors — keep it in_progress and create a new task for the blocker instead.",
 			"Task status uses pending → in_progress → completed, with completed → in_progress allowed for follow-up work; deleted is an immutable tombstone. Pass activeForm (present-continuous label, e.g. 'researching existing tool') when marking in_progress.",
 			"Use blockedBy to express dependencies (A is blocked by B). On create, pass blockedBy as the initial set. On update, use addBlockedBy / removeBlockedBy (additive merge — do not resend the full array). Cycles are rejected.",
-			"list hides tombstoned (deleted) tasks by default; pass includeDeleted:true to see them. Pass status to filter by a single status. list output is capped (~40KB) — narrow large lists with get/status filter.",
+			"list hides tombstoned (deleted) tasks by default; pass includeDeleted:true to see them. Pass status to filter by a single status. A session supports at most 500 tasks and each task at most 100 blockedBy dependencies; list output is capped at ~40KB and /todos shows at most 100 tasks. Use get/status filters to inspect larger lists.",
 			"Subject must be short and imperative (max 200 chars; e.g. 'Research existing tool'); description is for long-form detail. activeForm is a present-continuous label shown while in_progress.",
 		],
 		parameters: TodoParams,
@@ -1746,19 +1838,23 @@ export default function (pi: ExtensionAPI) {
 					text += "\nTip: pass activeForm (e.g. 'researching existing tool') to label this task in the overlay.";
 				}
 			}
-			// Only mutations store the full snapshot; read-only calls would just
-			// duplicate the same state over and over and bloat the session file.
+			// Persist only the mutation input, not another full copy of state.
+			// v2 records replay from the nearest legacy snapshot on session restore.
 			const isReadOnly = result.op.kind === "list" || result.op.kind === "get";
+			const createdTaskId = result.op.kind === "create" ? result.op.taskId : undefined;
+			const resultStatus: TaskStatus | undefined =
+				createdTaskId !== undefined
+					? state.tasks.find((task) => task.id === createdTaskId)?.status
+					: result.op.kind === "update"
+						? result.op.toStatus
+						: result.op.kind === "delete"
+							? "deleted"
+							: undefined;
 			const details: TaskDetails = {
 				action: normalized.action,
-				// write already stores the merged task list; dropping the duplicate
-				// todos array saves space in the snapshot.
-				params:
-					result.op.kind === "write"
-						? { ...normalized.params, todos: undefined }
-						: normalized.params,
+				params: normalized.params,
 				...(normalized.diagnostics ? { normalization: normalized.diagnostics } : {}),
-				...(isReadOnly ? {} : { version: 1, tasks: state.tasks, nextId: state.nextId }),
+				...(isReadOnly ? {} : { version: 2, resultStatus }),
 			};
 			return { content: [{ type: "text", text }], details };
 		},
@@ -1809,15 +1905,18 @@ export default function (pi: ExtensionAPI) {
 				case "write":
 					break;
 				case "create":
-					status = details.tasks ? details.tasks[details.tasks.length - 1]?.status : undefined;
+					status = details.resultStatus ?? (details.tasks ? details.tasks[details.tasks.length - 1]?.status : undefined);
 					break;
 				case "update": {
 					const params = details.params;
-					status = (params.status as TaskStatus) ?? details.tasks?.find((t) => t.id === params.id)?.status;
+					status =
+						(params.status as TaskStatus) ??
+						details.resultStatus ??
+						details.tasks?.find((t) => t.id === params.id)?.status;
 					break;
 				}
 				case "delete":
-					status = details.tasks?.find((t) => t.id === details.params.id)?.status;
+					status = details.resultStatus ?? details.tasks?.find((t) => t.id === details.params.id)?.status;
 					break;
 				case "list":
 				case "get":
@@ -1840,32 +1939,7 @@ export default function (pi: ExtensionAPI) {
 		description: "Show all todos on the current branch, grouped by status",
 		handler: async (_args, ctx) => {
 			if (ctx.mode !== "tui") {
-				// Non-TUI: output as notification
-				const visible = selectVisible(state);
-				if (visible.length === 0) {
-					ctx.ui.notify("No todos yet. Ask the agent to add some!", "info");
-					return;
-				}
-				const counts = selectCounts(state);
-				const groups = selectByStatus(state);
-				const headerParts: string[] = [];
-				if (counts.completed > 0) headerParts.push(`${counts.completed}/${counts.total} completed`);
-				if (counts.inProgress > 0) headerParts.push(`${counts.inProgress} in progress`);
-				if (counts.pending > 0) headerParts.push(`${counts.pending} pending`);
-				const lines: string[] = [headerParts.join(" · ")];
-				if (groups.pending.length > 0) {
-					lines.push("── Pending ──");
-					for (const t of groups.pending) lines.push(`  ○ #${t.id} ${t.subject}`);
-				}
-				if (groups.inProgress.length > 0) {
-					lines.push("── In Progress ──");
-					for (const t of groups.inProgress) lines.push(`  ◐ #${t.id} ${t.subject}`);
-				}
-				if (groups.completed.length > 0) {
-					lines.push("── Completed ──");
-					for (const t of groups.completed) lines.push(`  ✓ #${t.id} ${t.subject}`);
-				}
-				ctx.ui.notify(lines.join("\n"), "info");
+				ctx.ui.notify(formatTodosCommandText(state), "info");
 				return;
 			}
 

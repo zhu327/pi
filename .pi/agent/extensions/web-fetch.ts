@@ -294,15 +294,44 @@ interface ValidatedAddress {
 	family: 4 | 6
 }
 
+function awaitWithAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+	if (signal.aborted) {
+		return Promise.reject(signal.reason instanceof Error ? signal.reason : new WebToolError("aborted", "aborted"))
+	}
+	return new Promise<T>((resolve, reject) => {
+		const cleanup = () => signal.removeEventListener("abort", onAbort)
+		const onAbort = () => {
+			cleanup()
+			reject(signal.reason instanceof Error ? signal.reason : new WebToolError("aborted", "aborted"))
+		}
+		signal.addEventListener("abort", onAbort, { once: true })
+		promise.then(
+			(value) => {
+				cleanup()
+				resolve(value)
+			},
+			(error) => {
+				cleanup()
+				reject(error)
+			},
+		)
+	})
+}
+
 /** Resolve `host` and validate every returned address is global unicast. */
-async function resolveValidatedAddresses(host: string): Promise<ValidatedAddress[]> {
+async function resolveValidatedAddresses(host: string, signal: AbortSignal): Promise<ValidatedAddress[]> {
+	if (signal.aborted) throw signal.reason instanceof Error ? signal.reason : new WebToolError("aborted", "aborted")
 	let results: Array<{ address: string; family: number }>
 	try {
 		// URL.hostname keeps brackets around IPv6 literals ("[::1]"), which
 		// dns.lookup cannot parse — strip them so public IPv6 literal URLs are
 		// usable (they were already URL-validated by parseAndAssertHttpUrl).
-		results = await lookup(host.replace(/^\[|\]$/g, ""), { all: true, verbatim: true })
+		const pending = lookup(host.replace(/^\[|\]$/g, ""), { all: true, verbatim: true })
+		results = await awaitWithAbort(pending, signal)
 	} catch (error) {
+		if (signal.aborted) {
+			throw signal.reason instanceof Error ? signal.reason : new WebToolError("aborted", "aborted")
+		}
 		throw new WebToolError("dns_failed", `DNS lookup failed for ${host}: ${error instanceof Error ? error.message : String(error)}`)
 	}
 	const validated: ValidatedAddress[] = []
@@ -356,7 +385,7 @@ function pinnedLookup(validated: readonly ValidatedAddress[]) {
 async function fetchOncePinned(url: string, headers: Record<string, string>, signal: AbortSignal): Promise<{ response: Response; declaredLength?: number }> {
 	const parsed = parseAndAssertHttpUrl(url)
 	const host = parsed.hostname
-	const validated = await resolveValidatedAddresses(host)
+	const validated = await resolveValidatedAddresses(host, signal)
 	if (signal.aborted) throw new WebToolError("aborted", "aborted")
 
 	return new Promise<{ response: Response; declaredLength?: number }>((resolve, reject) => {
@@ -374,7 +403,7 @@ async function fetchOncePinned(url: string, headers: Record<string, string>, sig
 			},
 			(msg: IncomingMessage) => {
 				const declared = parseDeclaredLength(msg.headers["content-length"])
-				const encoding = String(msg.headers["content-encoding"] ?? "").toLowerCase()
+				const rawEncoding = String(msg.headers["content-encoding"] ?? "").toLowerCase()
 				const status = msg.statusCode ?? 200
 				// The fetch-spec Response constructor throws a RangeError on
 				// null-body statuses (204/205/304) when given a body, and on any
@@ -401,7 +430,7 @@ async function fetchOncePinned(url: string, headers: Record<string, string>, sig
 					}),
 					// The declared length only pre-checks when the body is NOT
 					// re-encoded (decompressed) on our side.
-					declaredLength: encoding || nullBodyStatus ? undefined : declared,
+					declaredLength: (rawEncoding.trim() !== "" && rawEncoding.trim() !== "identity") || nullBodyStatus ? undefined : declared,
 				})
 
 				if (nullBodyStatus) {
@@ -410,6 +439,15 @@ async function fetchOncePinned(url: string, headers: Record<string, string>, sig
 					// decompressor or body reader.
 					msg.resume()
 					resolve(makeResponse(null))
+					return
+				}
+
+				const encodings = rawEncoding.split(",").map((value) => value.trim()).filter(Boolean)
+				const encoding = encodings.length === 1 && encodings[0] === "identity" ? "" : (encodings[0] ?? "")
+				const supportedEncodings = new Set(["", "identity", "gzip", "x-gzip", "br", "deflate"])
+				if (encodings.length > 1 || !supportedEncodings.has(encoding)) {
+					msg.destroy()
+					reject(new WebToolError("unsupported_type", `Unsupported Content-Encoding: ${rawEncoding}`))
 					return
 				}
 
@@ -1050,7 +1088,9 @@ interface PendingTask {
 interface Flight {
 	promise: Promise<unknown>
 	controller: AbortController
-	callers: Set<AbortSignal>
+	callers: Set<object>
+	started: boolean
+	startCallbacks: Set<() => void>
 }
 
 /** Lowercased hostname for per-host throttling; the raw string on parse failure. */
@@ -1065,7 +1105,7 @@ function hostFromUrl(raw: string): string {
 export interface ScheduleOptions {
 	/** Caller's composite signal (user cancellation). Detaching never kills the flight while another caller waits. */
 	signal?: AbortSignal
-	/** Flight deadline in ms, armed when the request leaves the queue (queue wait does not burn the timeout). */
+	/** Per-caller deadline in ms, armed when the shared flight starts (queue wait does not burn the timeout). */
 	timeoutMs?: number
 	/** Host used for the per-host concurrency limit. Pass explicitly — cache keys are not URLs, so the fallback parse cannot recover it. */
 	host?: string
@@ -1096,14 +1136,26 @@ class RequestScheduler {
 	 * own deadline hits), so one caller can never kill another's request.
 	 */
 	schedule<T>(key: string, fn: (signal: AbortSignal) => Promise<T>, opts?: ScheduleOptions): Promise<T> {
+		if (opts?.signal?.aborted) {
+			return Promise.reject(opts.signal.reason instanceof Error ? opts.signal.reason : new WebToolError("aborted", "aborted"))
+		}
 		const cached = this.cacheGet<T>(key)
 		if (cached !== undefined) return Promise.resolve(cached)
-		const existing = this.flights.get(key)
-		if (existing) return this.attach(existing, opts?.signal) as Promise<T>
+		let existing = this.flights.get(key)
+		if (existing?.controller.signal.aborted) {
+			if (this.flights.get(key) === existing) this.flights.delete(key)
+			existing = undefined
+		}
+		if (existing) return this.attach(existing, opts?.signal, opts?.timeoutMs) as Promise<T>
 
 		const controller = new AbortController()
-		const callers = new Set<AbortSignal>()
-		const flight: Flight = { promise: Promise.resolve(null!), controller, callers }
+		const flight: Flight = {
+			promise: Promise.resolve(null!),
+			controller,
+			callers: new Set(),
+			started: false,
+			startCallbacks: new Set(),
+		}
 
 		const promise = new Promise<T>((resolve, reject) => {
 			this.queue.push({
@@ -1113,31 +1165,14 @@ class RequestScheduler {
 					if (controller.signal.aborted) {
 						return Promise.reject(controller.signal.reason ?? new Error("aborted"))
 					}
-					// Flight-level deadline: armed at dequeue so queue wait never
-					// burns the caller's timeout, and a hung flight can't outlive
-					// the last interested caller.
-					let timedOut = false
-					let flightTimer: ReturnType<typeof setTimeout> | undefined
-					if (opts?.timeoutMs) {
-						flightTimer = setTimeout(() => {
-							timedOut = true
-							controller.abort(new WebToolError("timeout", `Request timed out after ${opts.timeoutMs}ms`))
-						}, opts.timeoutMs)
-					}
-					const clear = () => clearTimeout(flightTimer)
+					flight.started = true
+					for (const start of flight.startCallbacks) start()
+					flight.startCallbacks.clear()
 					return Promise.resolve()
 						.then(() => fn(controller.signal))
 						.then((value) => {
-							this.cacheSet(key, value)
+							if (!controller.signal.aborted) this.cacheSet(key, value)
 							return value
-						})
-						.finally(clear)
-						.catch((error: unknown) => {
-							// A timeout abort can surface as a bare AbortError; normalize.
-							if (timedOut && !(error instanceof WebToolError)) {
-								throw new WebToolError("timeout", `Request timed out after ${opts?.timeoutMs}ms`)
-							}
-							throw error
 						})
 				},
 				resolve: resolve as (value: unknown) => void,
@@ -1150,8 +1185,9 @@ class RequestScheduler {
 			() => this.finishFlight(key, flight),
 		)
 		this.flights.set(key, flight)
+		const result = this.attach(flight, opts?.signal, opts?.timeoutMs)
 		this.pump()
-		return this.attach(flight, opts?.signal) as Promise<T>
+		return result as Promise<T>
 	}
 
 	private finishFlight(key: string, flight: Flight): void {
@@ -1163,31 +1199,62 @@ class RequestScheduler {
 	 * rejects as soon as THIS caller aborts — without killing the flight
 	 * while other callers still want it.
 	 */
-	private attach(flight: Flight, callerSignal?: AbortSignal): Promise<unknown> {
-		if (!callerSignal) return flight.promise
-		if (callerSignal.aborted) {
-			return Promise.reject(callerSignal.reason instanceof Error ? callerSignal.reason : new Error("aborted"))
+	private attach(flight: Flight, callerSignal?: AbortSignal, timeoutMs?: number): Promise<unknown> {
+		if (callerSignal?.aborted) {
+			return Promise.reject(callerSignal.reason instanceof Error ? callerSignal.reason : new WebToolError("aborted", "aborted"))
 		}
 		return new Promise<unknown>((resolve, reject) => {
-			const detach = () => {
-				callerSignal.removeEventListener("abort", onCallerAbort)
-				flight.callers.delete(callerSignal)
+			const caller = {}
+			flight.callers.add(caller)
+			let settled = false
+			let timer: ReturnType<typeof setTimeout> | undefined
+			let startCallback: (() => void) | undefined
+
+			const cleanup = () => {
+				if (timer !== undefined) clearTimeout(timer)
+				if (startCallback) flight.startCallbacks.delete(startCallback)
+				callerSignal?.removeEventListener("abort", onCallerAbort)
+				flight.callers.delete(caller)
+			}
+			const detach = (reason: Error) => {
+				if (settled) return
+				settled = true
+				cleanup()
+				// The shared request continues while another caller is still waiting.
+				if (flight.callers.size === 0 && !flight.controller.signal.aborted) flight.controller.abort(reason)
+				reject(reason)
 			}
 			const onCallerAbort = () => {
-				detach()
-				// Last caller out kills the flight — nobody needs the result.
-				if (flight.callers.size === 0) flight.controller.abort(callerSignal.reason)
-				reject(callerSignal.reason instanceof Error ? callerSignal.reason : new Error("aborted"))
+				const reason = callerSignal?.reason
+				detach(reason instanceof Error ? reason : new WebToolError("aborted", "aborted"))
 			}
-			flight.callers.add(callerSignal)
-			callerSignal.addEventListener("abort", onCallerAbort, { once: true })
+			const armTimeout = () => {
+				if (timeoutMs === undefined || timer !== undefined) return
+				timer = setTimeout(
+					() => detach(new WebToolError("timeout", `Request timed out after ${timeoutMs}ms`)),
+					timeoutMs,
+				)
+			}
+
+			if (timeoutMs !== undefined) {
+				if (flight.started) armTimeout()
+				else {
+					startCallback = armTimeout
+					flight.startCallbacks.add(startCallback)
+				}
+			}
+			callerSignal?.addEventListener("abort", onCallerAbort, { once: true })
 			flight.promise.then(
 				(value) => {
-					detach()
+					if (settled) return
+					settled = true
+					cleanup()
 					resolve(value)
 				},
 				(error) => {
-					detach()
+					if (settled) return
+					settled = true
+					cleanup()
 					reject(error)
 				},
 			)
@@ -1374,7 +1441,8 @@ async function executeFetch(
 			throw new WebToolError("unsupported_type", "Unsupported content type: binary payload detected (magic bytes or NULs). web-fetch supports text-like content only.")
 		}
 
-		const isHtml = contentType.includes("text/html") || contentType.includes("application/xhtml+xml")
+		const normalizedContentType = contentType.toLowerCase()
+		const isHtml = normalizedContentType.includes("text/html") || normalizedContentType.includes("application/xhtml+xml")
 		const title = isHtml ? extractTitle(body) : undefined
 
 		// Bound conversion work: convert only a source prefix; when the page
@@ -1518,11 +1586,10 @@ function createWebFetchTool(deps: { scheduler: RequestScheduler; artifacts: Arti
 				details: { url: sanitizeUrl(url), effective_url: sanitizeUrl(fetchPlan.fetchUrl) },
 			})
 
-			// WF-2: a composite caller signal that tracks user cancellation for
-			// the whole lifecycle. The deadline itself is owned by the scheduler
-			// flight (armed at dequeue — waiting for a concurrency slot no longer
-			// burns the timeout), and merged callers detach independently, so
-			// one caller's abort/timeout can never kill another's request.
+			// WF-2: a composite caller signal tracks user cancellation for the
+			// whole lifecycle. Each caller gets its own scheduler deadline when
+			// the shared flight starts (queue wait does not burn it); merged
+			// callers detach independently.
 			const controller = new AbortController()
 			const onAbort = () => controller.abort(signal?.reason)
 			if (signal?.aborted) onAbort()
@@ -1543,7 +1610,7 @@ function createWebFetchTool(deps: { scheduler: RequestScheduler; artifacts: Arti
 				}
 			} catch (error) {
 				// User cancellation is classified by the caller's own signal;
-				// flight timeouts arrive as WebToolError("timeout").
+				// per-caller deadlines arrive as WebToolError("timeout").
 				if (controller.signal.aborted || signal?.aborted) throw new Error("aborted")
 				if (error instanceof WebToolError) {
 					if (error.code === "aborted") throw new Error("aborted")
